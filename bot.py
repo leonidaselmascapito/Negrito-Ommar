@@ -14,7 +14,6 @@ import re
 from datetime import timedelta
 
 # --- CONFIGURACIÓN Y CONSTANTES ---
-TOKEN = "TU_TOKEN_AQUI"
 PREFIX = ".n "
 
 MUTE_ROLE_ID = 1483621610819948635
@@ -439,5 +438,4 @@ async def phash_cmd(ctx, target: str, *, rules: str = None):
 
 keep_alive()
 TOKEN = os.getenv("DISCORD_TOKEN")
-client.run(TOKEN)
 bot.run(TOKEN)
