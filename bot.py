@@ -8,6 +8,8 @@ from PIL import Image
 import imagehash
 import io
 import aiohttp
+import os
+from keep_alive import keep_alive
 import re
 from datetime import timedelta
 
@@ -435,4 +437,7 @@ async def phash_cmd(ctx, target: str, *, rules: str = None):
         except aiosqlite.IntegrityError:
             await ctx.send(f"⚠️ Este hash `{img_hash}` ya existe en la base de datos.")
 
+keep_alive()
+TOKEN = os.getenv("DISCORD_TOKEN")
+client.run(TOKEN)
 bot.run(TOKEN)
