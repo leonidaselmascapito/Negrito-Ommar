@@ -1,15 +1,28 @@
 from flask import Flask
 from threading import Thread
+import os
 
 app = Flask(__name__)
 
-@app.route('/')
+@app.route("/")
 def home():
-    return "El bot está vivo y ejecutándose."
+    return "Discord moderation bot is running.", 200
 
-def run():
-    app.run(host='0.0.0.0', port=8080)
+@app.route("/health")
+def health():
+    return {"status": "ok"}, 200
+
+
+def _run():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=False,
+        use_reloader=False
+    )
+
 
 def keep_alive():
-    t = Thread(target=run)
-    t.start()
+    thread = Thread(target=_run, daemon=True)
+    thread.start()
