@@ -45,8 +45,6 @@ intents.members = True
 
 bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
-# One timer per user. Persistent state lives in SQLite, so a restart
-# does not permanently lose a temporary mute/ban.
 punishment_tasks: dict[tuple[int, int], asyncio.Task] = {}
 phash_scan_lock = asyncio.Lock()
 
@@ -101,7 +99,6 @@ async def init_db():
             )
         """)
 
-        # Migrate the database created by the older version.
         await _add_column_if_missing(db, "warns", "guild_id", "INTEGER NOT NULL DEFAULT 0")
         await _add_column_if_missing(db, "warns", "source", "TEXT NOT NULL DEFAULT 'manual'")
 
@@ -132,16 +129,6 @@ def discord_timestamp(ts: float) -> str:
 
 
 def calculate_warn_weight(rules_str: str) -> tuple[int, Optional[str]]:
-    """
-    Rule weights:
-      1 -> +2
-      5 -> +2
-      3 -> direct ban of 3 days, but +0 weight
-      others -> +1
-
-    Numeric values 3/4/5/7/10/13 are punishment thresholds,
-    not rule numbers, so a rule 3/5 cannot be confused with them.
-    """
     rules = [r.strip() for r in rules_str.split(",") if r.strip()]
     weight = 0
     direct_punishment = None
@@ -184,7 +171,6 @@ def punishment_label(kind: str) -> str:
 
 
 def choose_punishment(total_points: int, direct_punishment: Optional[str]) -> str:
-    """Select the most severe applicable punishment."""
     selected = "none"
 
     if total_points >= 13:
@@ -218,7 +204,6 @@ def punishment_expiry(kind: str, current_expiry: Optional[float] = None) -> Opti
         "ban_31d": BAN_31D,
     }
     if kind in durations:
-        # Do not unnecessarily reset an already-running punishment of the same type.
         if current_expiry and current_expiry > now_ts():
             return current_expiry
         return now_ts() + durations[kind]
@@ -236,7 +221,6 @@ def normalize_user_query(value: str) -> str:
 async def resolve_member(guild: discord.Guild, query: str) -> Optional[discord.Member]:
     query = query.strip()
 
-    # Direct mention.
     match = re.fullmatch(r"<@!?([0-9]{15,25})>", query)
     if match:
         member = guild.get_member(int(match.group(1)))
@@ -247,7 +231,6 @@ async def resolve_member(guild: discord.Guild, query: str) -> Optional[discord.M
         except (discord.NotFound, discord.HTTPException):
             return None
 
-    # Raw numeric ID.
     if query.isdigit():
         user_id = int(query)
         member = guild.get_member(user_id)
@@ -260,7 +243,6 @@ async def resolve_member(guild: discord.Guild, query: str) -> Optional[discord.M
 
     lowered = query.casefold()
 
-    # Exact username/display name search in cache.
     for member in guild.members:
         candidates = {
             member.name.casefold(),
@@ -270,7 +252,6 @@ async def resolve_member(guild: discord.Guild, query: str) -> Optional[discord.M
         if lowered in candidates:
             return member
 
-    # Fallback: substring display/name match.
     matches = [
         member for member in guild.members
         if lowered in member.name.casefold() or lowered in member.display_name.casefold()
@@ -295,9 +276,7 @@ async def send_logs(guild: Optional[discord.Guild], embed: discord.Embed):
             continue
         try:
             await channel.send(embed=embed)
-        except discord.Forbidden:
-            pass
-        except discord.HTTPException:
+        except (discord.Forbidden, discord.HTTPException):
             pass
 
 
@@ -306,7 +285,7 @@ async def send_logs(guild: Optional[discord.Guild], embed: discord.Embed):
 # ============================================================
 async def generate_warn_id() -> str:
     while True:
-        warn_id = secrets.token_hex(8)  # 8 bytes -> 16 hexadecimal chars
+        warn_id = secrets.token_hex(8)
         async with await db_connect() as db:
             async with db.execute("SELECT 1 FROM warns WHERE warn_id = ?", (warn_id,)) as cursor:
                 if not await cursor.fetchone():
@@ -334,7 +313,6 @@ async def get_user_warn_count(guild_id: int, user_id: int) -> int:
 
 
 async def get_user_direct_rules(guild_id: int, user_id: int) -> Optional[str]:
-    """Return a direct punishment if any current warn contains rule 3."""
     async with await db_connect() as db:
         async with db.execute(
             "SELECT rules FROM warns WHERE guild_id = ? AND user_id = ?",
@@ -460,11 +438,6 @@ async def clear_sanction(user_id: int):
         await db.execute("DELETE FROM sanctions WHERE user_id = ?", (user_id,))
         await db.commit()
 
-    task = punishment_tasks.pop((0, user_id), None)
-    if task and not task.done():
-        task.cancel()
-
-    # Cancel any task stored under another guild key as a safety measure.
     for key, task in list(punishment_tasks.items()):
         if key[1] == user_id:
             if not task.done():
@@ -537,7 +510,6 @@ async def apply_or_update_punishment(guild: discord.Guild, user: discord.Member,
     current = await get_active_sanction(guild.id, user.id)
     current_type = current["sanction_type"] if current else "none"
 
-    # Nothing to do if there is already an equal/more severe active punishment.
     if current and punishment_rank(current_type) >= punishment_rank(desired):
         if current_type != "none":
             await schedule_sanction_expiry(
@@ -548,7 +520,6 @@ async def apply_or_update_punishment(guild: discord.Guild, user: discord.Member,
             )
             return punishment_label(current_type)
 
-    # Remove previous bot-controlled effect before switching sanction type.
     if current and current_type != desired:
         await remove_bot_sanction_effect(guild, user.id, current_type)
 
@@ -571,10 +542,7 @@ async def apply_or_update_punishment(guild: discord.Guild, user: discord.Member,
 
     elif desired.startswith("ban_"):
         try:
-            # For a member currently in the guild, ban directly. For a user not in the guild,
-            # fetch the user and ban that ID.
-            target = user
-            await guild.ban(target, reason=reason, delete_message_days=0)
+            await guild.ban(user, reason=reason, delete_message_days=0)
         except discord.Forbidden:
             return "No se pudo aplicar el baneo: faltan permisos"
         except discord.HTTPException:
@@ -597,7 +565,6 @@ async def reconcile_user_sanction(guild: discord.Guild, user_id: int) -> str:
     target = await get_user_punishment_target(guild.id, user_id)
     current = await get_active_sanction(guild.id, user_id)
 
-    # No sanction should remain.
     if target == "none":
         if current:
             await remove_bot_sanction_effect(guild, user_id, current["sanction_type"])
@@ -607,7 +574,6 @@ async def reconcile_user_sanction(guild: discord.Guild, user_id: int) -> str:
 
     member = guild.get_member(user_id)
     if not member:
-        # If the target user was kicked or left, preserve the DB state but don't invent a new kick.
         if current and punishment_rank(current["sanction_type"]) >= punishment_rank(target):
             return punishment_label(current["sanction_type"])
         return f"Debería aplicarse: {punishment_label(target)} (usuario no presente)"
@@ -642,7 +608,6 @@ async def restore_active_sanctions():
                     await member.add_roles(role, reason="Restauración de sanción temporal tras reinicio")
 
             elif sanction_type.startswith("ban_"):
-                # Re-assert the bot's temporary/permanent ban after a restart.
                 try:
                     await guild.fetch_ban(await bot.fetch_user(user_id))
                 except discord.NotFound:
@@ -703,7 +668,6 @@ class WarnModal(discord.ui.Modal, title="Editar Warn"):
         embed.add_field(name="Puntos totales", value=str(new_points))
         embed.add_field(name="Estado de sanción", value=new_punishment)
         embed.add_field(name="Moderador", value=interaction.user.mention)
-        embed.set_footer(text="Modificación registrada por el sistema de moderación")
         await send_logs(guild, embed)
 
         await interaction.response.send_message(
@@ -850,7 +814,6 @@ class WarnPaginationView(discord.ui.View):
         await interaction.response.edit_message(embed=self.generate_embed(), view=self)
 
     async def check_mod_navigation(self, interaction: discord.Interaction) -> bool:
-        # Pagination can be used by users with Manage Messages; modification is restricted further.
         if not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("Solo miembros del servidor pueden usar este botón.", ephemeral=True)
             return False
@@ -1041,6 +1004,7 @@ async def find_matching_phash(guild_id: int, current_hash: str) -> Optional[aios
             best_distance = distance
     return best
 
+
 # ============================================================
 # EVENTS
 # ============================================================
@@ -1057,7 +1021,6 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
-    # Automatic pHash moderation for image attachments.
     if message.attachments:
         image_attachment = next(
             (
@@ -1079,7 +1042,6 @@ async def on_message(message: discord.Message):
                                     current_hash, _ = await make_phash(blob)
                                     match = await find_matching_phash(message.guild.id, current_hash)
                                     if match:
-                                        # One automatic warn per message, using the rules stored with the hash.
                                         warn_id, points, desired = await create_warn(
                                             message.guild,
                                             message.author,
@@ -1119,146 +1081,152 @@ async def on_message(message: discord.Message):
 @bot.command(name="warn")
 @commands.has_permissions(manage_messages=True)
 async def warn_command(ctx: commands.Context, user_query: str, *, rules: str):
-    if not ctx.guild:
-        return await ctx.send("Este comando solo funciona en un servidor.")
-
-    user = await resolve_member(ctx.guild, user_query)
-    if not user:
-        return await ctx.send("No pude encontrar ese usuario. Usa ID, mención o nombre de usuario.")
-
     try:
+        if not ctx.guild:
+            return await ctx.send("Este comando solo funciona en un servidor.")
+
+        user = await resolve_member(ctx.guild, user_query)
+        if not user:
+            return await ctx.send("No pude encontrar ese usuario. Usa ID, mención o nombre de usuario.")
+
         warn_id, points, desired = await create_warn(ctx.guild, user, ctx.author, rules)
-    except ValueError as exc:
-        return await ctx.send(str(exc))
 
-    action = await apply_or_update_punishment(
-        ctx.guild,
-        user,
-        desired,
-        reason=f"Warn {warn_id} | Regla(s): {rules}",
-    )
+        action = await apply_or_update_punishment(
+            ctx.guild,
+            user,
+            desired,
+            reason=f"Warn {warn_id} | Regla(s): {rules}",
+        )
 
-    warn_count = await get_user_warn_count(ctx.guild.id, user.id)
+        warn_count = await get_user_warn_count(ctx.guild.id, user.id)
 
-    embed = discord.Embed(title="Usuario advertido", color=discord.Color.red())
-    embed.add_field(name="Usuario", value=f"{user.mention} ({user.id})")
-    embed.add_field(name="Moderador", value=ctx.author.mention)
-    embed.add_field(name="Regla(s)", value=rules_to_text(rules))
-    embed.add_field(name="ID del Warn", value=f"`{warn_id}`")
-    embed.add_field(name="Peso de este Warn", value=str(calculate_warn_weight(rules)[0]))
-    embed.add_field(name="Warns registrados", value=str(warn_count))
-    embed.add_field(name="Puntos acumulados", value=str(points))
-    embed.add_field(name="Acción tomada", value=action)
-    await send_logs(ctx.guild, embed)
+        embed = discord.Embed(title="Usuario advertido", color=discord.Color.red())
+        embed.add_field(name="Usuario", value=f"{user.mention} ({user.id})")
+        embed.add_field(name="Moderador", value=ctx.author.mention)
+        embed.add_field(name="Regla(s)", value=rules_to_text(rules))
+        embed.add_field(name="ID del Warn", value=f"`{warn_id}`")
+        embed.add_field(name="Peso de este Warn", value=str(calculate_warn_weight(rules)[0]))
+        embed.add_field(name="Warns registrados", value=str(warn_count))
+        embed.add_field(name="Puntos acumulados", value=str(points))
+        embed.add_field(name="Acción tomada", value=action)
+        await send_logs(ctx.guild, embed)
 
-    await ctx.send(
-        f"⚠️ {user.mention} ha recibido un warn. "
-        f"ID: `{warn_id}` | Puntos: **{points}** | Acción: **{action}**"
-    )
+        await ctx.send(
+            f"⚠️ {user.mention} ha recibido un warn. "
+            f"ID: `{warn_id}` | Puntos: **{points}** | Acción: **{action}**"
+        )
+    except Exception as e:
+        await ctx.send(f"Error al aplicar warn: `{e}`")
+        print(f"[warn error] {e}")
 
 
 @bot.command(name="warns")
 @commands.has_permissions(manage_messages=True)
 async def warns_command(ctx: commands.Context, subcommand: str = "", *, user_query: str = ""):
-    if not ctx.guild:
-        return await ctx.send("Este comando solo funciona en un servidor.")
+    try:
+        if not ctx.guild:
+            return await ctx.send("Este comando solo funciona en un servidor.")
 
-    if subcommand.casefold() != "list":
-        return await ctx.send("Uso: `.n warns list` o `.n warns list <usuario>`")
+        if subcommand.casefold() != "list":
+            return await ctx.send("Uso: `.n warns list` o `.n warns list <usuario>`")
 
-    user = None
-    if user_query.strip():
-        user = await resolve_member(ctx.guild, user_query.strip())
-        if not user:
-            return await ctx.send("No pude encontrar ese usuario. Usa ID, mención o nombre de usuario.")
+        user = None
+        if user_query.strip():
+            user = await resolve_member(ctx.guild, user_query.strip())
+            if not user:
+                return await ctx.send("No pude encontrar ese usuario. Usa ID, mención o nombre de usuario.")
 
-    async with await db_connect() as db:
-        if user:
-            async with db.execute(
-                "SELECT * FROM warns WHERE guild_id = ? AND user_id = ? ORDER BY timestamp DESC",
-                (ctx.guild.id, user.id),
-            ) as cursor:
-                data = await cursor.fetchall()
-        else:
-            async with db.execute(
-                "SELECT * FROM warns WHERE guild_id = ? ORDER BY timestamp DESC",
-                (ctx.guild.id,),
-            ) as cursor:
-                data = await cursor.fetchall()
+        async with await db_connect() as db:
+            if user:
+                async with db.execute(
+                    "SELECT * FROM warns WHERE guild_id = ? AND user_id = ? ORDER BY timestamp DESC",
+                    (ctx.guild.id, user.id),
+                ) as cursor:
+                    data = await cursor.fetchall()
+            else:
+                async with db.execute(
+                    "SELECT * FROM warns WHERE guild_id = ? ORDER BY timestamp DESC",
+                    (ctx.guild.id,),
+                ) as cursor:
+                    data = await cursor.fetchall()
 
-    if not data:
-        return await ctx.send(
-            "No hay warns registrados en el servidor."
-            if not user else f"El usuario {user.display_name} no tiene warns."
-        )
+        if not data:
+            return await ctx.send(
+                "No hay warns registrados en el servidor."
+                if not user else f"El usuario {user.display_name} no tiene warns."
+            )
 
-    view = WarnPaginationView(data, is_global=user is None, user=user)
-    await ctx.send(embed=view.generate_embed(), view=view)
+        view = WarnPaginationView(data, is_global=user is None, user=user)
+        await ctx.send(embed=view.generate_embed(), view=view)
+    except Exception as e:
+        await ctx.send(f"Error al listar warns: `{e}`")
+        print(f"[warns error] {e}")
 
 
 @bot.command(name="pHash")
 @commands.has_permissions(manage_messages=True)
 async def phash_command(ctx: commands.Context, target: str, *, rules: str = ""):
-    if not ctx.guild:
-        return await ctx.send("Este comando solo funciona en un servidor.")
-
-    if target.casefold() == "list":
-        async with await db_connect() as db:
-            async with db.execute(
-                "SELECT * FROM phashes WHERE guild_id = ? ORDER BY timestamp DESC",
-                (ctx.guild.id,),
-            ) as cursor:
-                data = await cursor.fetchall()
-
-        if not data:
-            return await ctx.send("La base de datos de hashes está vacía.")
-
-        view = PHashPaginationView(data)
-        return await ctx.send(embed=view.generate_embed(), view=view)
-
-    if not rules:
-        return await ctx.send("Uso: `.n pHash <mensaje|ID|link|respuesta> <reglas>`")
-
-    target_msg, image_bytes = await download_image_from_message(ctx, target)
-    if not image_bytes:
-        return await ctx.send(
-            "No se pudo obtener una imagen. Responde a un mensaje con imagen, usa el ID del mensaje "
-            "o un link de Discord válido que contenga una imagen."
-        )
-
     try:
-        img_hash, bits = await make_phash(image_bytes)
-    except ValueError as exc:
-        return await ctx.send(str(exc))
+        if not ctx.guild:
+            return await ctx.send("Este comando solo funciona en un servidor.")
 
-    rules = rules_to_text(rules)
-    async with await db_connect() as db:
-        try:
-            await db.execute(
-                """
-                INSERT INTO phashes
-                    (hash, hash_algo, hash_bits, rules, added_by, guild_id, timestamp, image_blob)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (img_hash, "phash", bits, rules, ctx.author.id, ctx.guild.id, now_ts(), image_bytes),
+        if target.casefold() == "list":
+            async with await db_connect() as db:
+                async with db.execute(
+                    "SELECT * FROM phashes WHERE guild_id = ? ORDER BY timestamp DESC",
+                    (ctx.guild.id,),
+                ) as cursor:
+                    data = await cursor.fetchall()
+
+            if not data:
+                return await ctx.send("La base de datos de hashes está vacía.")
+
+            view = PHashPaginationView(data)
+            return await ctx.send(embed=view.generate_embed(), view=view)
+
+        if not rules:
+            return await ctx.send("Uso: `.n pHash <mensaje|ID|link|respuesta> <reglas>`")
+
+        target_msg, image_bytes = await download_image_from_message(ctx, target)
+        if not image_bytes:
+            return await ctx.send(
+                "No se pudo obtener una imagen. Responde a un mensaje con imagen, usa el ID del mensaje "
+                "o un link de Discord válido que contenga una imagen."
             )
-            await db.commit()
-        except aiosqlite.IntegrityError:
-            return await ctx.send(f"⚠️ El hash `{img_hash}` ya existe en la base de datos.")
 
-    embed = discord.Embed(title="pHash registrado", color=discord.Color.green())
-    embed.add_field(name="Hash", value=f"`{img_hash}`")
-    embed.add_field(name="Precisión", value=f"{bits} bits ({PHASH_HASH_SIZE}×{PHASH_HASH_SIZE})")
-    embed.add_field(name="Reglas asociadas", value=rules)
-    embed.add_field(name="Registrado por", value=ctx.author.mention)
-    if target_msg:
-        embed.add_field(name="Mensaje origen", value=str(target_msg.id))
-    await send_logs(ctx.guild, embed)
+        img_hash, bits = await make_phash(image_bytes)
 
-    await ctx.send(
-        f"✅ Imagen registrada con pHash `{img_hash}` ({bits} bits). "
-        f"Reglas asociadas: `{rules}`. El BLOB de la imagen quedó guardado en la base de datos."
-    )
+        rules = rules_to_text(rules)
+        async with await db_connect() as db:
+            try:
+                await db.execute(
+                    """
+                    INSERT INTO phashes
+                        (hash, hash_algo, hash_bits, rules, added_by, guild_id, timestamp, image_blob)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (img_hash, "phash", bits, rules, ctx.author.id, ctx.guild.id, now_ts(), image_bytes),
+                )
+                await db.commit()
+            except aiosqlite.IntegrityError:
+                return await ctx.send(f"⚠️ El hash `{img_hash}` ya existe en la base de datos.")
+
+        embed = discord.Embed(title="pHash registrado", color=discord.Color.green())
+        embed.add_field(name="Hash", value=f"`{img_hash}`")
+        embed.add_field(name="Precisión", value=f"{bits} bits ({PHASH_HASH_SIZE}×{PHASH_HASH_SIZE})")
+        embed.add_field(name="Reglas asociadas", value=rules)
+        embed.add_field(name="Registrado por", value=ctx.author.mention)
+        if target_msg:
+            embed.add_field(name="Mensaje origen", value=str(target_msg.id))
+        await send_logs(ctx.guild, embed)
+
+        await ctx.send(
+            f"✅ Imagen registrada con pHash `{img_hash}` ({bits} bits). "
+            f"Reglas asociadas: `{rules}`. El BLOB de la imagen quedó guardado en la base de datos."
+        )
+    except Exception as e:
+        await ctx.send(f"Error en pHash: `{e}`")
+        print(f"[pHash error] {e}")
 
 
 # ============================================================
@@ -1274,6 +1242,9 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
         return await ctx.send("Faltan argumentos. Revisa la sintaxis del comando.")
     if isinstance(error, commands.BadArgument):
         return await ctx.send("Uno de los argumentos no es válido.")
+
+    # Cualquier otro error → avisar en el chat
+    await ctx.send(f"Ocurrió un error inesperado: `{error}`")
     print(f"[command error] {ctx.command}: {error}")
 
 
