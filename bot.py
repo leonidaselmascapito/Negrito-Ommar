@@ -4,6 +4,7 @@ import os
 import re
 import secrets
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -51,16 +52,20 @@ phash_scan_lock = asyncio.Lock()
 # ============================================================
 # DATABASE
 # ============================================================
+@asynccontextmanager
 async def db_connect():
     db = await aiosqlite.connect(DB_PATH)
     db.row_factory = aiosqlite.Row
     await db.execute("PRAGMA journal_mode=WAL")
     await db.execute("PRAGMA foreign_keys=ON")
-    return db
+    try:
+        yield db
+    finally:
+        await db.close()
 
 
 async def init_db():
-    async with await db_connect() as db:
+    async with db_connect() as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS warns (
                 warn_id TEXT PRIMARY KEY,
@@ -286,14 +291,14 @@ async def send_logs(guild: Optional[discord.Guild], embed: discord.Embed):
 async def generate_warn_id() -> str:
     while True:
         warn_id = secrets.token_hex(8)
-        async with await db_connect() as db:
+        async with db_connect() as db:
             async with db.execute("SELECT 1 FROM warns WHERE warn_id = ?", (warn_id,)) as cursor:
                 if not await cursor.fetchone():
                     return warn_id
 
 
 async def get_user_points(guild_id: int, user_id: int) -> int:
-    async with await db_connect() as db:
+    async with db_connect() as db:
         async with db.execute(
             "SELECT COALESCE(SUM(weight), 0) FROM warns WHERE guild_id = ? AND user_id = ?",
             (guild_id, user_id),
@@ -303,7 +308,7 @@ async def get_user_points(guild_id: int, user_id: int) -> int:
 
 
 async def get_user_warn_count(guild_id: int, user_id: int) -> int:
-    async with await db_connect() as db:
+    async with db_connect() as db:
         async with db.execute(
             "SELECT COUNT(*) FROM warns WHERE guild_id = ? AND user_id = ?",
             (guild_id, user_id),
@@ -313,7 +318,7 @@ async def get_user_warn_count(guild_id: int, user_id: int) -> int:
 
 
 async def get_user_direct_rules(guild_id: int, user_id: int) -> Optional[str]:
-    async with await db_connect() as db:
+    async with db_connect() as db:
         async with db.execute(
             "SELECT rules FROM warns WHERE guild_id = ? AND user_id = ?",
             (guild_id, user_id),
@@ -348,7 +353,7 @@ async def create_warn(
     weight, direct = calculate_warn_weight(rules)
     ts = now_ts()
 
-    async with await db_connect() as db:
+    async with db_connect() as db:
         await db.execute(
             """
             INSERT INTO warns
@@ -365,7 +370,7 @@ async def create_warn(
 
 
 async def delete_warn(warn_id: str) -> Optional[aiosqlite.Row]:
-    async with await db_connect() as db:
+    async with db_connect() as db:
         async with db.execute("SELECT * FROM warns WHERE warn_id = ?", (warn_id,)) as cursor:
             row = await cursor.fetchone()
         if not row:
@@ -382,7 +387,7 @@ async def update_warn_rules(warn_id: str, new_rules: str) -> Optional[aiosqlite.
 
     new_weight, _ = calculate_warn_weight(new_rules)
 
-    async with await db_connect() as db:
+    async with db_connect() as db:
         async with db.execute("SELECT * FROM warns WHERE warn_id = ?", (warn_id,)) as cursor:
             old_row = await cursor.fetchone()
         if not old_row:
@@ -400,7 +405,7 @@ async def update_warn_rules(warn_id: str, new_rules: str) -> Optional[aiosqlite.
 # PERSISTENT SANCTIONS
 # ============================================================
 async def get_active_sanction(guild_id: int, user_id: int) -> Optional[aiosqlite.Row]:
-    async with await db_connect() as db:
+    async with db_connect() as db:
         async with db.execute(
             "SELECT * FROM sanctions WHERE guild_id = ? AND user_id = ?",
             (guild_id, user_id),
@@ -416,7 +421,7 @@ async def save_sanction(
     reason: str,
 ):
     ts = now_ts()
-    async with await db_connect() as db:
+    async with db_connect() as db:
         await db.execute(
             """
             INSERT INTO sanctions(user_id, guild_id, sanction_type, expires_at, reason, created_at, updated_at)
@@ -434,7 +439,7 @@ async def save_sanction(
 
 
 async def clear_sanction(user_id: int):
-    async with await db_connect() as db:
+    async with db_connect() as db:
         await db.execute("DELETE FROM sanctions WHERE user_id = ?", (user_id,))
         await db.commit()
 
@@ -587,7 +592,7 @@ async def reconcile_user_sanction(guild: discord.Guild, user_id: int) -> str:
 
 
 async def restore_active_sanctions():
-    async with await db_connect() as db:
+    async with db_connect() as db:
         async with db.execute("SELECT * FROM sanctions") as cursor:
             rows = await cursor.fetchall()
 
@@ -698,7 +703,7 @@ class InputIDModal(discord.ui.Modal):
         if not re.fullmatch(r"[0-9a-f]{16}", wid):
             return await interaction.response.send_message("El ID debe tener exactamente 16 caracteres hexadecimales.", ephemeral=True)
 
-        async with await db_connect() as db:
+        async with db_connect() as db:
             async with db.execute("SELECT * FROM warns WHERE warn_id = ?", (wid,)) as cursor:
                 row = await cursor.fetchone()
 
@@ -988,7 +993,7 @@ def hamming_distance(hex_a: str, hex_b: str) -> int:
 
 
 async def find_matching_phash(guild_id: int, current_hash: str) -> Optional[aiosqlite.Row]:
-    async with await db_connect() as db:
+    async with db_connect() as db:
         async with db.execute(
             "SELECT * FROM phashes WHERE guild_id = ? ORDER BY timestamp DESC",
             (guild_id,),
@@ -1136,7 +1141,7 @@ async def warns_command(ctx: commands.Context, subcommand: str = "", *, user_que
             if not user:
                 return await ctx.send("No pude encontrar ese usuario. Usa ID, mención o nombre de usuario.")
 
-        async with await db_connect() as db:
+        async with db_connect() as db:
             if user:
                 async with db.execute(
                     "SELECT * FROM warns WHERE guild_id = ? AND user_id = ? ORDER BY timestamp DESC",
@@ -1171,7 +1176,7 @@ async def phash_command(ctx: commands.Context, target: str, *, rules: str = ""):
             return await ctx.send("Este comando solo funciona en un servidor.")
 
         if target.casefold() == "list":
-            async with await db_connect() as db:
+            async with db_connect() as db:
                 async with db.execute(
                     "SELECT * FROM phashes WHERE guild_id = ? ORDER BY timestamp DESC",
                     (ctx.guild.id,),
@@ -1197,7 +1202,7 @@ async def phash_command(ctx: commands.Context, target: str, *, rules: str = ""):
         img_hash, bits = await make_phash(image_bytes)
 
         rules = rules_to_text(rules)
-        async with await db_connect() as db:
+        async with db_connect() as db:
             try:
                 await db.execute(
                     """
@@ -1243,7 +1248,6 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     if isinstance(error, commands.BadArgument):
         return await ctx.send("Uno de los argumentos no es válido.")
 
-    # Cualquier otro error → avisar en el chat
     await ctx.send(f"Ocurrió un error inesperado: `{error}`")
     print(f"[command error] {ctx.command}: {error}")
 
