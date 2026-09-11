@@ -1,8 +1,6 @@
 discord.py
-Flask
 aiosqlite
 Pillow
-imagehash
-numpy
-scipy
-PyWavelets
+ImageHash
+aiohttp
+Flask
