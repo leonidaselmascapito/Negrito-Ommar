@@ -1,3 +1,4 @@
-discord.py
+4discord.py
 Flask
 aiosqlite
+Pillow
