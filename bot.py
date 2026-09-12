@@ -1,6 +1,7 @@
 import asyncio
 import io
 import os
+import random
 import re
 import secrets
 import time
@@ -28,6 +29,7 @@ LOG_CHANNELS = [1541275389450649680, 1483728856962826240]
 MOD_ROLES = [1483621610975002771, 1483621610975002772]
 APPEAL_ACCEPT_ROLE = 1483621610975002772
 PHASH_LIST_ROLE = 1483701058852356276
+MARKOV_ADMIN_ROLE = 1483621610975002771          # Solo este rol puede activar/desactivar Markov
 
 AWARN_ROLES = [
     1483621610975002769,
@@ -58,6 +60,7 @@ markov_last_reply: dict[int, float] = defaultdict(float)
 MARKOV_MAX_CHARS = 10 * 1024 * 1024
 MARKOV_EVERY = 15
 MARKOV_COOLDOWN = 2.0
+MARKOV_HISTORY_LIMIT = 2560
 
 # ============================================================
 # DISCORD
@@ -208,6 +211,10 @@ def can_use_phash_list(member: discord.Member) -> bool:
     return any(role.id == PHASH_LIST_ROLE for role in getattr(member, "roles", []))
 
 
+def can_control_markov(member: discord.Member) -> bool:
+    return any(role.id == MARKOV_ADMIN_ROLE for role in getattr(member, "roles", []))
+
+
 def get_staff_level(member: discord.Member) -> int:
     for i, rid in enumerate(AWARN_ROLES):
         if any(r.id == rid for r in member.roles):
@@ -264,7 +271,7 @@ def generate_id() -> str:
 # MARKOV HELPERS
 # ============================================================
 def build_markov_model(text: str):
-    if not text or len(text) < 80:
+    if not text or len(text) < 50:
         return None
     try:
         return markovify.Text(text, state_size=3)
@@ -275,7 +282,6 @@ def build_markov_model(text: str):
 def generate_markov_sentence(channel_id: int, max_words: int = 75) -> Optional[str]:
     model = markov_models.get(channel_id)
     if not model:
-        # intentar construir al vuelo
         corpus = markov_corpus.get(channel_id, "")
         model = build_markov_model(corpus)
         if model:
@@ -283,9 +289,39 @@ def generate_markov_sentence(channel_id: int, max_words: int = 75) -> Optional[s
         else:
             return None
     try:
-        return model.make_sentence(tries=40, max_words=max_words)
+        return model.make_sentence(tries=50, max_words=max_words)
     except Exception:
         return None
+
+
+async def load_channel_history(channel: discord.TextChannel, limit: int = MARKOV_HISTORY_LIMIT) -> int:
+    """Carga los últimos N mensajes del canal y construye el corpus + modelo."""
+    texts = []
+    count = 0
+    try:
+        async for msg in channel.history(limit=limit):
+            if msg.author.bot:
+                continue
+            content = msg.content.strip()
+            if content and not content.startswith(PREFIX):
+                texts.append(content)
+                count += 1
+    except Exception as e:
+        print(f"[markov history] {e}")
+        return 0
+
+    if not texts:
+        return 0
+
+    # Unir de más antiguo a más reciente
+    full_text = " ".join(reversed(texts))
+    if len(full_text) > MARKOV_MAX_CHARS:
+        full_text = full_text[-MARKOV_MAX_CHARS:]
+
+    markov_corpus[channel.id] = full_text
+    markov_models[channel.id] = build_markov_model(full_text)
+    markov_message_count[channel.id] = count
+    return count
 
 
 # ============================================================
@@ -580,6 +616,13 @@ class AppealView(discord.ui.View):
     async def appeal(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.user_id:
             return await interaction.response.send_message("Solo el sancionado puede apelar.", ephemeral=True)
+
+        # Evitar múltiples apelaciones para el mismo warn
+        async with db_connect() as db:
+            existing = await db_fetchone(db, "SELECT appeal_id FROM appeals WHERE warn_id=? AND status='pending'", (self.warn_id,))
+            if existing:
+                return await interaction.response.send_message("Ya existe una apelación pendiente para este warn.", ephemeral=True)
+
         appeal_id = generate_id()
         async with db_connect() as db:
             await db_execute(
@@ -587,6 +630,7 @@ class AppealView(discord.ui.View):
                 "INSERT INTO appeals (appeal_id,user_id,guild_id,warn_id,detected_hash,blacklist_hash,message_id,status,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
                 (appeal_id, self.user_id, interaction.guild.id, self.warn_id, self.detected_hash, self.blacklist_hash, self.message_id, "pending", now_ts())
             )
+
         embed = discord.Embed(title="Nueva apelación", color=discord.Color.orange())
         embed.add_field(name="Usuario", value=f"<@{self.user_id}>")
         embed.add_field(name="Warn ID", value=f"`{self.warn_id}`")
@@ -605,11 +649,19 @@ class AppealModView(discord.ui.View):
         self.detected_hash = detected_hash
         self.warn_id = warn_id
 
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not can_accept_appeals(interaction.user):
+            await interaction.response.send_message("Solo el rol autorizado puede gestionar apelaciones.", ephemeral=True)
+            return False
+        return True
+
     @discord.ui.button(label="Aceptar apelación", style=discord.ButtonStyle.success)
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not can_accept_appeals(interaction.user):
-            return await interaction.response.send_message("Solo el rol autorizado puede aceptar apelaciones.", ephemeral=True)
         async with db_connect() as db:
+            row = await db_fetchone(db, "SELECT status FROM appeals WHERE appeal_id=?", (self.appeal_id,))
+            if not row or row["status"] != "pending":
+                return await interaction.response.send_message("Esta apelación ya fue resuelta.", ephemeral=True)
+
             await db_execute(
                 db,
                 "INSERT OR IGNORE INTO whitelist (hash, guild_id, added_by, timestamp, reason) VALUES (?,?,?,?,?)",
@@ -617,40 +669,67 @@ class AppealModView(discord.ui.View):
             )
             await db_execute(db, "DELETE FROM warns WHERE warn_id=?", (self.warn_id,))
             await db_execute(db, "UPDATE appeals SET status='accepted' WHERE appeal_id=?", (self.appeal_id,))
+
         cur = await get_active_sanction(interaction.guild.id, self.user_id)
         if cur:
             await remove_effect(interaction.guild, self.user_id, cur["sanction_type"])
             await clear_sanction(self.user_id)
+
+        # Desactivar botones
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(view=self)
+
         embed = discord.Embed(title="Apelación aceptada", color=discord.Color.green())
         embed.add_field(name="Usuario", value=f"<@{self.user_id}>")
         embed.add_field(name="Hash añadido a whitelist", value=f"`{self.detected_hash}`")
         embed.add_field(name="Moderador", value=interaction.user.mention)
         await send_logs(interaction.guild, embed)
-        await interaction.response.send_message("Apelación aceptada. Hash detectado añadido a whitelist y sanción retirada.", ephemeral=True)
+        await interaction.followup.send("Apelación aceptada. Hash añadido a whitelist y sanción retirada.", ephemeral=True)
         self.stop()
 
     @discord.ui.button(label="Rechazar", style=discord.ButtonStyle.danger)
     async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not can_accept_appeals(interaction.user):
-            return await interaction.response.send_message("Solo el rol autorizado puede rechazar apelaciones.", ephemeral=True)
         async with db_connect() as db:
+            row = await db_fetchone(db, "SELECT status FROM appeals WHERE appeal_id=?", (self.appeal_id,))
+            if not row or row["status"] != "pending":
+                return await interaction.response.send_message("Esta apelación ya fue resuelta.", ephemeral=True)
             await db_execute(db, "UPDATE appeals SET status='rejected' WHERE appeal_id=?", (self.appeal_id,))
-        await interaction.response.send_message("Apelación rechazada.", ephemeral=True)
+
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(view=self)
+        await interaction.followup.send("Apelación rechazada.", ephemeral=True)
         self.stop()
 
 
 class MarkovView(discord.ui.View):
     def __init__(self, channel_id: int):
-        super().__init__(timeout=120)
+        super().__init__(timeout=180)
         self.channel_id = channel_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not can_control_markov(interaction.user):
+            await interaction.response.send_message("Solo el rol de administrador autorizado puede controlar Markov.", ephemeral=True)
+            return False
+        return True
 
     @discord.ui.button(label="Activar", style=discord.ButtonStyle.success)
     async def activate(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
         markov_enabled.add(self.channel_id)
-        await interaction.response.edit_message(
-            content=f"✅ **Modo Markov activado** en este canal.\nEnviaré un mensaje cada {MARKOV_EVERY} mensajes.",
-            view=None
+
+        # Cargar historial
+        channel = interaction.channel
+        count = await load_channel_history(channel, MARKOV_HISTORY_LIMIT)
+
+        await interaction.followup.send(
+            f"✅ **Modo Markov activado** en este canal.\n"
+            f"Se cargaron **{count}** mensajes del historial.\n"
+            f"Enviaré un mensaje cada {MARKOV_EVERY} mensajes.",
+            ephemeral=False
         )
+        self.stop()
 
     @discord.ui.button(label="Desactivar", style=discord.ButtonStyle.danger)
     async def deactivate(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -659,6 +738,19 @@ class MarkovView(discord.ui.View):
             content="❌ **Modo Markov desactivado** en este canal.\nLa base de texto se mantiene.",
             view=None
         )
+        self.stop()
+
+    @discord.ui.button(label="Solo ver estado", style=discord.ButtonStyle.secondary)
+    async def status(self, interaction: discord.Interaction, button: discord.ui.Button):
+        status = "activado" if self.channel_id in markov_enabled else "desactivado"
+        corpus_len = len(markov_corpus.get(self.channel_id, ""))
+        await interaction.response.edit_message(
+            content=f"Estado actual de Markov en este canal: **{status}**\n"
+                    f"Tamaño del corpus: **{corpus_len}** caracteres.\n"
+                    f"No se realizó ningún cambio.",
+            view=None
+        )
+        self.stop()
 
 
 class WarnPaginationView(discord.ui.View):
@@ -937,13 +1029,11 @@ async def on_message(message: discord.Message):
             current_text = markov_corpus[message.channel.id]
             if len(current_text) < MARKOV_MAX_CHARS:
                 markov_corpus[message.channel.id] = (current_text + " " + content).strip()
-                # reconstruir modelo de vez en cuando
-                if markov_message_count[message.channel.id] % 25 == 0:
+                if markov_message_count[message.channel.id] % 20 == 0:
                     markov_models[message.channel.id] = build_markov_model(markov_corpus[message.channel.id])
 
         markov_message_count[message.channel.id] += 1
 
-        # enviar cadena cada X mensajes
         if markov_message_count[message.channel.id] % MARKOV_EVERY == 0:
             sentence = generate_markov_sentence(message.channel.id)
             if sentence:
@@ -952,7 +1042,6 @@ async def on_message(message: discord.Message):
                 except Exception:
                     pass
 
-        # responder si contestan a un mensaje de Markov del bot
         if message.reference and message.reference.message_id:
             try:
                 ref = message.reference.resolved
@@ -979,46 +1068,43 @@ async def on_message(message: discord.Message):
 async def markov_command(ctx: commands.Context):
     if not ctx.guild:
         return await ctx.send("Solo en servidor.")
+
+    if not can_control_markov(ctx.author):
+        return await ctx.send("Solo el rol de administrador autorizado puede controlar el modo Markov.")
+
     view = MarkovView(ctx.channel.id)
     status = "activado" if ctx.channel.id in markov_enabled else "desactivado"
     await ctx.send(
-        f"¿Activar modo de cadena de Markov?\n"
+        f"**Modo Markov**\n"
         f"Estado actual: **{status}**\n"
-        f"Enviaré un mensaje cada {MARKOV_EVERY} mensajes (solo en este canal).",
+        f"Al activar se cargarán los últimos **{MARKOV_HISTORY_LIMIT}** mensajes del canal.\n"
+        f"Elige una opción:",
         view=view
     )
-    
+
+
 @bot.command(name="phrase")
 @commands.has_permissions(manage_messages=True)
 async def phrase_command(ctx: commands.Context):
-    """Fuerza al bot a generar una frase de Markov en este canal."""
     if not ctx.guild:
         return await ctx.send("Solo en servidor.")
 
-    channel_id = ctx.channel.id
+    if ctx.channel.id not in markov_enabled:
+        return await ctx.send("Markov no está activado en este canal. Usa `.n markov` primero.")
 
-    # Intentar generar
-    sentence = generate_markov_sentence(channel_id, max_words=70)
+    sentence = generate_markov_sentence(ctx.channel.id, max_words=70)
 
     if sentence:
         await ctx.send(sentence)
     else:
-        # Mensajes chistosos cuando no hay suficiente texto o falla
         frases_error = [
             "Todavía no he absorbido suficiente caos de este canal... escribid más.",
             "Mi cerebro de Markov está vacío. Alimentadme con mensajes.",
             "Error 404: Personalidad no encontrada. Necesito más texto.",
             "Aún no tengo suficiente material para decir estupideces de calidad.",
             "Estoy en modo silencio porque este canal es demasiado aburrido todavía.",
-            "O me alimentan con texto, ¡o me convierto en Manolo la alpaca!",
-            "Texto, texto 🔔",
-            "DENME MÁS TEXTO, CHAVALES.",
-            "Les pediré amablemente que compartáis más texto y mensajes, así me permitiré armar cadenas de Markov. 🧐",
-            "DADME TEXTO 😈👌",
-            "Hola pibe, dame texto 😛"
             "No tengo frases. Solo vacío existencial. Escribid más."
         ]
-        import random
         await ctx.send(random.choice(frases_error))
 
 
