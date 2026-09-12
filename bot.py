@@ -4,15 +4,15 @@ import os
 import re
 import secrets
 import time
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from typing import Optional, Any
 
 import aiohttp
 import discord
-import markovify
-from collections import defaultdict
 import imagehash
 import libsql
+import markovify
 from PIL import Image, UnidentifiedImageError
 from discord.ext import commands
 
@@ -50,12 +50,12 @@ BAN_1D = 24 * 60 * 60
 BAN_31D = 31 * 24 * 60 * 60
 
 # ==================== MARKOV ====================
-markov_enabled = set()          # channel_ids donde está activado
-markov_models = {}              # channel_id → modelo markovify
-markov_corpus = defaultdict(str)  # channel_id → texto acumulado
-markov_message_count = defaultdict(int)
-markov_last_reply = defaultdict(float)  # cooldown de respuestas
-MARKOV_MAX_CHARS = 10 * 1024 * 1024   # 10 MB
+markov_enabled: set[int] = set()
+markov_models: dict[int, Any] = {}
+markov_corpus: dict[int, str] = defaultdict(str)
+markov_message_count: dict[int, int] = defaultdict(int)
+markov_last_reply: dict[int, float] = defaultdict(float)
+MARKOV_MAX_CHARS = 10 * 1024 * 1024
 MARKOV_EVERY = 15
 MARKOV_COOLDOWN = 2.0
 
@@ -101,7 +101,6 @@ async def db_fetchall(conn, sql: str, params: tuple = ()):
     def _fetch():
         cur = conn.execute(sql, params)
         rows = cur.fetchall()
-        # Convertir a dict-like para compatibilidad
         if cur.description:
             cols = [d[0] for d in cur.description]
             return [dict(zip(cols, row)) for row in rows]
@@ -259,10 +258,13 @@ async def send_logs(guild: Optional[discord.Guild], embed: discord.Embed, view: 
 
 def generate_id() -> str:
     return secrets.token_hex(8)
-    
-    
+
+
+# ============================================================
+# MARKOV HELPERS
+# ============================================================
 def build_markov_model(text: str):
-    if not text or len(text) < 100:
+    if not text or len(text) < 80:
         return None
     try:
         return markovify.Text(text, state_size=3)
@@ -270,13 +272,18 @@ def build_markov_model(text: str):
         return None
 
 
-def generate_markov_sentence(channel_id: int, max_words: int = 80) -> Optional[str]:
+def generate_markov_sentence(channel_id: int, max_words: int = 75) -> Optional[str]:
     model = markov_models.get(channel_id)
     if not model:
-        return None
+        # intentar construir al vuelo
+        corpus = markov_corpus.get(channel_id, "")
+        model = build_markov_model(corpus)
+        if model:
+            markov_models[channel_id] = model
+        else:
+            return None
     try:
-        sentence = model.make_sentence(tries=50, max_words=max_words)
-        return sentence
+        return model.make_sentence(tries=40, max_words=max_words)
     except Exception:
         return None
 
@@ -632,6 +639,28 @@ class AppealModView(discord.ui.View):
         self.stop()
 
 
+class MarkovView(discord.ui.View):
+    def __init__(self, channel_id: int):
+        super().__init__(timeout=120)
+        self.channel_id = channel_id
+
+    @discord.ui.button(label="Activar", style=discord.ButtonStyle.success)
+    async def activate(self, interaction: discord.Interaction, button: discord.ui.Button):
+        markov_enabled.add(self.channel_id)
+        await interaction.response.edit_message(
+            content=f"✅ **Modo Markov activado** en este canal.\nEnviaré un mensaje cada {MARKOV_EVERY} mensajes.",
+            view=None
+        )
+
+    @discord.ui.button(label="Desactivar", style=discord.ButtonStyle.danger)
+    async def deactivate(self, interaction: discord.Interaction, button: discord.ui.Button):
+        markov_enabled.discard(self.channel_id)
+        await interaction.response.edit_message(
+            content="❌ **Modo Markov desactivado** en este canal.\nLa base de texto se mantiene.",
+            view=None
+        )
+
+
 class WarnPaginationView(discord.ui.View):
     def __init__(self, data, is_global, user=None, page=1):
         super().__init__(timeout=300)
@@ -843,53 +872,16 @@ class DeleteHashModal(discord.ui.Modal, title="Borrar pHash"):
 async def on_ready():
     await init_db()
     await expire_old_warns()
-    print(f"Bot listo | {bot.user} | Turso | Hamming ≤ {PHASH_MAX_DISTANCE}")
+    print(f"Bot listo | {bot.user} | Turso | Hamming ≤ {PHASH_MAX_DISTANCE} | Markov listo")
 
 
 @bot.event
 async def on_message(message: discord.Message):
-# ==================== MARKOV ====================
-    if message.guild and message.channel.id in markov_enabled and not message.author.bot:
-        # Guardar texto del canal
-        content = message.content.strip()
-        if content and not content.startswith(PREFIX):
-            current = markov_corpus[message.channel.id]
-            if len(current) < MARKOV_MAX_CHARS:
-                markov_corpus[message.channel.id] += " " + content
-                # Reconstruir modelo cada cierto tiempo
-                if markov_message_count[message.channel.id] % 30 == 0:
-                    markov_models[message.channel.id] = build_markov_model(markov_corpus[message.channel.id])
-
-        markov_message_count[message.channel.id] += 1
-
-        # Enviar cadena cada 15 mensajes
-        if markov_message_count[message.channel.id] % MARKOV_EVERY == 0:
-            sentence = generate_markov_sentence(message.channel.id)
-            if sentence:
-                try:
-                    await message.channel.send(sentence)
-                except Exception:
-                    pass
-
-        # Si responden a un mensaje de Markov del bot
-        if (message.reference and message.reference.message_id and 
-            message.author.id != bot.user.id):
-            try:
-                ref = await message.channel.fetch_message(message.reference.message_id)
-                if ref.author.id == bot.user.id:
-                    now = time.time()
-                    if now - markov_last_reply[message.channel.id] >= MARKOV_COOLDOWN:
-                        markov_last_reply[message.channel.id] = now
-                        reply = generate_markov_sentence(message.channel.id, max_words=60)
-                        if reply:
-                            await message.reply(reply)
-            except Exception:
-                pass
-)
     if message.author.bot or not message.guild:
         await bot.process_commands(message)
         return
 
+    # ==================== pHash auto ====================
     if message.attachments:
         att = next((a for a in message.attachments if (a.content_type and a.content_type.startswith("image/")) or a.filename.lower().endswith((".png",".jpg",".jpeg",".webp",".gif",".bmp"))), None)
         if att and att.size <= MAX_IMAGE_BYTES:
@@ -938,12 +930,65 @@ async def on_message(message: discord.Message):
                 except Exception as e:
                     print(f"[pHash auto] {e}")
 
+    # ==================== MARKOV ====================
+    if message.channel.id in markov_enabled and not message.author.bot:
+        content = message.content.strip()
+        if content and not content.startswith(PREFIX):
+            current_text = markov_corpus[message.channel.id]
+            if len(current_text) < MARKOV_MAX_CHARS:
+                markov_corpus[message.channel.id] = (current_text + " " + content).strip()
+                # reconstruir modelo de vez en cuando
+                if markov_message_count[message.channel.id] % 25 == 0:
+                    markov_models[message.channel.id] = build_markov_model(markov_corpus[message.channel.id])
+
+        markov_message_count[message.channel.id] += 1
+
+        # enviar cadena cada X mensajes
+        if markov_message_count[message.channel.id] % MARKOV_EVERY == 0:
+            sentence = generate_markov_sentence(message.channel.id)
+            if sentence:
+                try:
+                    await message.channel.send(sentence)
+                except Exception:
+                    pass
+
+        # responder si contestan a un mensaje de Markov del bot
+        if message.reference and message.reference.message_id:
+            try:
+                ref = message.reference.resolved
+                if ref is None:
+                    ref = await message.channel.fetch_message(message.reference.message_id)
+                if ref and ref.author.id == bot.user.id:
+                    now = time.time()
+                    if now - markov_last_reply[message.channel.id] >= MARKOV_COOLDOWN:
+                        markov_last_reply[message.channel.id] = now
+                        reply = generate_markov_sentence(message.channel.id, max_words=55)
+                        if reply:
+                            await message.reply(reply)
+            except Exception:
+                pass
+
     await bot.process_commands(message)
 
 
 # ============================================================
 # COMMANDS
 # ============================================================
+@bot.command(name="markov")
+@commands.has_permissions(manage_messages=True)
+async def markov_command(ctx: commands.Context):
+    if not ctx.guild:
+        return await ctx.send("Solo en servidor.")
+    view = MarkovView(ctx.channel.id)
+    status = "activado" if ctx.channel.id in markov_enabled else "desactivado"
+    await ctx.send(
+        f"¿Activar modo de cadena de Markov?\n"
+        f"Estado actual: **{status}**\n"
+        f"Enviaré un mensaje cada {MARKOV_EVERY} mensajes (solo en este canal).",
+        view=view
+    )
+
+
 @bot.command(name="warn")
 @commands.has_permissions(manage_messages=True)
 async def warn_command(ctx: commands.Context, user_query: str, *, rest: str):
@@ -1146,42 +1191,6 @@ async def awarns_command(ctx: commands.Context, subcommand: str = "", *, user_qu
         await ctx.send(embed=embed)
     except Exception as e:
         await ctx.send(f"Error: `{e}`")
-        
-        
-
-class MarkovView(discord.ui.View):
-    def __init__(self, channel_id: int):
-        super().__init__(timeout=120)
-        self.channel_id = channel_id
-
-    @discord.ui.button(label="Activar", style=discord.ButtonStyle.success)
-    async def activate(self, interaction: discord.Interaction, button: discord.ui.Button):
-        markov_enabled.add(self.channel_id)
-        await interaction.response.edit_message(
-            content=f"✅ **Modo Markov activado** en este canal.\nEnviaré un mensaje cada {MARKOV_EVERY} mensajes.",
-            view=None
-        )
-
-    @discord.ui.button(label="Desactivar", style=discord.ButtonStyle.danger)
-    async def deactivate(self, interaction: discord.Interaction, button: discord.ui.Button):
-        markov_enabled.discard(self.channel_id)
-        await interaction.response.edit_message(
-            content="❌ **Modo Markov desactivado** en este canal.\nLa base de texto se mantiene.",
-            view=None
-        )
-
-
-@bot.command(name="markov")
-@commands.has_permissions(manage_messages=True)
-async def markov_command(ctx: commands.Context):
-    if not ctx.guild:
-        return await ctx.send("Solo en servidor.")
-    
-    view = MarkovView(ctx.channel.id)
-    await ctx.send(
-        "¿Activar modo de cadena de Markov?\nEnviaré un mensaje cada 15 mensajes.",
-        view=view
-    )
 
 
 # ============================================================
