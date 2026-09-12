@@ -5,12 +5,12 @@ import re
 import secrets
 import time
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Optional, Any
 
 import aiohttp
-import aiosqlite
 import discord
 import imagehash
+import libsql
 from PIL import Image, UnidentifiedImageError
 from discord.ext import commands
 
@@ -24,10 +24,9 @@ PREFIX = ".n "
 MUTE_ROLE_ID = 1483621610819948635
 LOG_CHANNELS = [1541275389450649680, 1483728856962826240]
 MOD_ROLES = [1483621610975002771, 1483621610975002772]
-APPEAL_ACCEPT_ROLE = 1483621610975002772          # Solo este rol puede aceptar/rechazar apelaciones
-PHASH_LIST_ROLE = 1483701058852356276             # Solo este rol puede usar .n pHash list
+APPEAL_ACCEPT_ROLE = 1483621610975002772
+PHASH_LIST_ROLE = 1483701058852356276
 
-# Roles para el sistema de awarn (jerarquía de menor a mayor)
 AWARN_ROLES = [
     1483621610975002769,
     1483621610975002770,
@@ -35,11 +34,13 @@ AWARN_ROLES = [
     1483621610975002772,
 ]
 
-DB_PATH = os.getenv("MODERATION_DB_PATH", "/var/data/moderation.db" if os.path.isdir("/var/data") else "moderation.db")
+TURSO_URL = os.getenv("TURSO_DATABASE_URL")
+TURSO_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
+
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 PHASH_HASH_SIZE = 8
 PHASH_MAX_DISTANCE = 8
-WARN_EXPIRE_DAYS = 60  # 2 meses
+WARN_EXPIRE_DAYS = 60
 
 MUTE_1H = 60 * 60
 MUTE_1D = 24 * 60 * 60
@@ -59,23 +60,51 @@ punishment_tasks: dict[tuple[int, int], asyncio.Task] = {}
 phash_scan_lock = asyncio.Lock()
 
 # ============================================================
-# DATABASE
+# DATABASE (Turso / libsql)
 # ============================================================
+def _get_conn():
+    if not TURSO_URL or not TURSO_TOKEN:
+        raise RuntimeError("Faltan TURSO_DATABASE_URL o TURSO_AUTH_TOKEN")
+    return libsql.connect(database=TURSO_URL, auth_token=TURSO_TOKEN)
+
+
 @asynccontextmanager
 async def db_connect():
-    db = await aiosqlite.connect(DB_PATH)
-    db.row_factory = aiosqlite.Row
-    await db.execute("PRAGMA journal_mode=WAL")
-    await db.execute("PRAGMA foreign_keys=ON")
+    conn = await asyncio.to_thread(_get_conn)
     try:
-        yield db
+        yield conn
     finally:
-        await db.close()
+        await asyncio.to_thread(conn.close)
+
+
+async def db_execute(conn, sql: str, params: tuple = ()):
+    def _exec():
+        cur = conn.execute(sql, params)
+        conn.commit()
+        return cur
+    return await asyncio.to_thread(_exec)
+
+
+async def db_fetchall(conn, sql: str, params: tuple = ()):
+    def _fetch():
+        cur = conn.execute(sql, params)
+        rows = cur.fetchall()
+        # Convertir a dict-like para compatibilidad
+        if cur.description:
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, row)) for row in rows]
+        return rows
+    return await asyncio.to_thread(_fetch)
+
+
+async def db_fetchone(conn, sql: str, params: tuple = ()):
+    rows = await db_fetchall(conn, sql, params)
+    return rows[0] if rows else None
 
 
 async def init_db():
     async with db_connect() as db:
-        await db.execute("""
+        await db_execute(db, """
             CREATE TABLE IF NOT EXISTS warns (
                 warn_id TEXT PRIMARY KEY,
                 user_id INTEGER NOT NULL,
@@ -89,8 +118,7 @@ async def init_db():
                 expired INTEGER NOT NULL DEFAULT 0
             )
         """)
-
-        await db.execute("""
+        await db_execute(db, """
             CREATE TABLE IF NOT EXISTS phashes (
                 hash TEXT PRIMARY KEY,
                 sanctions TEXT NOT NULL,
@@ -100,8 +128,7 @@ async def init_db():
                 image_blob BLOB
             )
         """)
-
-        await db.execute("""
+        await db_execute(db, """
             CREATE TABLE IF NOT EXISTS whitelist (
                 hash TEXT PRIMARY KEY,
                 guild_id INTEGER NOT NULL,
@@ -110,8 +137,7 @@ async def init_db():
                 reason TEXT
             )
         """)
-
-        await db.execute("""
+        await db_execute(db, """
             CREATE TABLE IF NOT EXISTS sanctions (
                 user_id INTEGER PRIMARY KEY,
                 guild_id INTEGER NOT NULL,
@@ -122,8 +148,7 @@ async def init_db():
                 updated_at REAL NOT NULL
             )
         """)
-
-        await db.execute("""
+        await db_execute(db, """
             CREATE TABLE IF NOT EXISTS appeals (
                 appeal_id TEXT PRIMARY KEY,
                 user_id INTEGER NOT NULL,
@@ -136,8 +161,7 @@ async def init_db():
                 created_at REAL NOT NULL
             )
         """)
-
-        await db.execute("""
+        await db_execute(db, """
             CREATE TABLE IF NOT EXISTS awarns (
                 awarn_id TEXT PRIMARY KEY,
                 user_id INTEGER NOT NULL,
@@ -148,8 +172,6 @@ async def init_db():
                 weight INTEGER NOT NULL DEFAULT 1
             )
         """)
-
-        await db.commit()
 
 
 # ============================================================
@@ -176,7 +198,6 @@ def can_use_phash_list(member: discord.Member) -> bool:
 
 
 def get_staff_level(member: discord.Member) -> int:
-    """Devuelve el índice en AWARN_ROLES (0 = más bajo). -1 si no es staff."""
     for i, rid in enumerate(AWARN_ROLES):
         if any(r.id == rid for r in member.roles):
             return i
@@ -229,7 +250,7 @@ def generate_id() -> str:
 
 
 # ============================================================
-# SANCIONES pHash (letras)
+# SANCIONES pHash
 # ============================================================
 PHASH_MAP = {
     "a": ("warn", 1, "Warn"),
@@ -280,63 +301,59 @@ def punishment_label(kind: str) -> str:
 
 
 # ============================================================
-# WARN / AWARN DB
+# WARN / AWARN
 # ============================================================
 async def create_warn(guild, user, moderator, reason: str, weight: int = 1, source: str = "manual", message_id: int = None):
     warn_id = generate_id()
     ts = now_ts()
     async with db_connect() as db:
-        await db.execute(
+        await db_execute(
+            db,
             "INSERT INTO warns (warn_id, user_id, mod_id, guild_id, reason, timestamp, weight, source, message_id) VALUES (?,?,?,?,?,?,?,?,?)",
             (warn_id, user.id, moderator.id, guild.id, reason[:96], ts, weight, source, message_id)
         )
-        await db.commit()
     return warn_id
 
 
 async def get_user_points(guild_id: int, user_id: int) -> int:
     async with db_connect() as db:
-        async with db.execute(
-            "SELECT COALESCE(SUM(weight),0) FROM warns WHERE guild_id=? AND user_id=? AND expired=0",
+        row = await db_fetchone(
+            db,
+            "SELECT COALESCE(SUM(weight),0) as total FROM warns WHERE guild_id=? AND user_id=? AND expired=0",
             (guild_id, user_id)
-        ) as cur:
-            row = await cur.fetchone()
-    return int(row[0] or 0)
+        )
+    return int(row["total"] if row else 0)
 
 
 async def expire_old_warns():
     cutoff = now_ts() - (WARN_EXPIRE_DAYS * 86400)
     async with db_connect() as db:
-        await db.execute("UPDATE warns SET expired=1 WHERE timestamp < ? AND expired=0", (cutoff,))
-        await db.commit()
+        await db_execute(db, "UPDATE warns SET expired=1 WHERE timestamp < ? AND expired=0", (cutoff,))
 
 
 # ============================================================
-# SANCTIONS (mute/ban/kick)
+# SANCTIONS
 # ============================================================
 async def get_active_sanction(guild_id: int, user_id: int):
     async with db_connect() as db:
-        async with db.execute("SELECT * FROM sanctions WHERE guild_id=? AND user_id=?", (guild_id, user_id)) as cur:
-            return await cur.fetchone()
+        return await db_fetchone(db, "SELECT * FROM sanctions WHERE guild_id=? AND user_id=?", (guild_id, user_id))
 
 
 async def save_sanction(guild_id, user_id, sanction_type, expires_at, reason):
     ts = now_ts()
     async with db_connect() as db:
-        await db.execute("""
+        await db_execute(db, """
             INSERT INTO sanctions(user_id, guild_id, sanction_type, expires_at, reason, created_at, updated_at)
             VALUES (?,?,?,?,?,?,?)
             ON CONFLICT(user_id) DO UPDATE SET
                 guild_id=excluded.guild_id, sanction_type=excluded.sanction_type,
                 expires_at=excluded.expires_at, reason=excluded.reason, updated_at=excluded.updated_at
         """, (user_id, guild_id, sanction_type, expires_at, reason, ts, ts))
-        await db.commit()
 
 
 async def clear_sanction(user_id: int):
     async with db_connect() as db:
-        await db.execute("DELETE FROM sanctions WHERE user_id=?", (user_id,))
-        await db.commit()
+        await db_execute(db, "DELETE FROM sanctions WHERE user_id=?", (user_id,))
     for key in list(punishment_tasks.keys()):
         if key[1] == user_id:
             t = punishment_tasks.pop(key, None)
@@ -491,8 +508,7 @@ def hamming(a: str, b: str) -> int:
 
 async def find_match(guild_id: int, current: str):
     async with db_connect() as db:
-        async with db.execute("SELECT * FROM phashes WHERE guild_id=?", (guild_id,)) as cur:
-            rows = await cur.fetchall()
+        rows = await db_fetchall(db, "SELECT * FROM phashes WHERE guild_id=?", (guild_id,))
     best = None
     best_d = 999
     for r in rows:
@@ -505,8 +521,8 @@ async def find_match(guild_id: int, current: str):
 
 async def is_whitelisted(guild_id: int, h: str) -> bool:
     async with db_connect() as db:
-        async with db.execute("SELECT 1 FROM whitelist WHERE guild_id=? AND hash=?", (guild_id, h)) as cur:
-            return await cur.fetchone() is not None
+        row = await db_fetchone(db, "SELECT 1 FROM whitelist WHERE guild_id=? AND hash=?", (guild_id, h))
+        return row is not None
 
 
 # ============================================================
@@ -527,11 +543,11 @@ class AppealView(discord.ui.View):
             return await interaction.response.send_message("Solo el sancionado puede apelar.", ephemeral=True)
         appeal_id = generate_id()
         async with db_connect() as db:
-            await db.execute(
+            await db_execute(
+                db,
                 "INSERT INTO appeals (appeal_id,user_id,guild_id,warn_id,detected_hash,blacklist_hash,message_id,status,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
                 (appeal_id, self.user_id, interaction.guild.id, self.warn_id, self.detected_hash, self.blacklist_hash, self.message_id, "pending", now_ts())
             )
-            await db.commit()
         embed = discord.Embed(title="Nueva apelación", color=discord.Color.orange())
         embed.add_field(name="Usuario", value=f"<@{self.user_id}>")
         embed.add_field(name="Warn ID", value=f"`{self.warn_id}`")
@@ -554,16 +570,14 @@ class AppealModView(discord.ui.View):
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not can_accept_appeals(interaction.user):
             return await interaction.response.send_message("Solo el rol autorizado puede aceptar apelaciones.", ephemeral=True)
-        # Añadir el hash DETECTADO a la whitelist (no borramos el de la blacklist)
         async with db_connect() as db:
-            await db.execute(
+            await db_execute(
+                db,
                 "INSERT OR IGNORE INTO whitelist (hash, guild_id, added_by, timestamp, reason) VALUES (?,?,?,?,?)",
                 (self.detected_hash, interaction.guild.id, interaction.user.id, now_ts(), f"Apelación aceptada {self.appeal_id}")
             )
-            await db.execute("DELETE FROM warns WHERE warn_id=?", (self.warn_id,))
-            await db.execute("UPDATE appeals SET status='accepted' WHERE appeal_id=?", (self.appeal_id,))
-            await db.commit()
-        # Quitar sanción activa
+            await db_execute(db, "DELETE FROM warns WHERE warn_id=?", (self.warn_id,))
+            await db_execute(db, "UPDATE appeals SET status='accepted' WHERE appeal_id=?", (self.appeal_id,))
         cur = await get_active_sanction(interaction.guild.id, self.user_id)
         if cur:
             await remove_effect(interaction.guild, self.user_id, cur["sanction_type"])
@@ -581,8 +595,7 @@ class AppealModView(discord.ui.View):
         if not can_accept_appeals(interaction.user):
             return await interaction.response.send_message("Solo el rol autorizado puede rechazar apelaciones.", ephemeral=True)
         async with db_connect() as db:
-            await db.execute("UPDATE appeals SET status='rejected' WHERE appeal_id=?", (self.appeal_id,))
-            await db.commit()
+            await db_execute(db, "UPDATE appeals SET status='rejected' WHERE appeal_id=?", (self.appeal_id,))
         await interaction.response.send_message("Apelación rechazada.", ephemeral=True)
         self.stop()
 
@@ -617,12 +630,12 @@ class WarnPaginationView(discord.ui.View):
         start = (self.page - 1) * self.per_page
         page_data = self.data[start:start + self.per_page]
         title = "Lista global de warns" if self.is_global else f"Warns de {self.user.display_name if self.user else 'usuario'}"
-        total = sum(int(r["weight"]) for r in self.data if not r["expired"])
+        total = sum(int(r.get("weight", 0)) for r in self.data if not r.get("expired"))
         embed = discord.Embed(title=title, color=discord.Color.orange(),
                               description=f"**Puntos activos:** {total}\n**Registros:** {len(self.data)}")
         embed.set_footer(text=f"Página {self.page}/{self.total_pages}")
         for r in page_data:
-            expired = " (CADUCADO)" if r["expired"] else ""
+            expired = " (CADUCADO)" if r.get("expired") else ""
             embed.add_field(
                 name=f"ID: `{r['warn_id']}`{expired}",
                 value=(f"**Usuario:** <@{r['user_id']}>\n"
@@ -676,14 +689,12 @@ class EditWarnModal(discord.ui.Modal, title="Editar Warn"):
             return await interaction.response.send_message("Sin permisos.", ephemeral=True)
         wid = self.warn_id.value.strip().lower()
         async with db_connect() as db:
-            async with db.execute("SELECT * FROM warns WHERE warn_id=?", (wid,)) as cur:
-                row = await cur.fetchone()
+            row = await db_fetchone(db, "SELECT * FROM warns WHERE warn_id=?", (wid,))
             if not row:
                 return await interaction.response.send_message("Warn no encontrado.", ephemeral=True)
             if row["user_id"] == interaction.user.id:
                 return await interaction.response.send_message("No puedes editar un warn dirigido a ti mismo.", ephemeral=True)
-            await db.execute("UPDATE warns SET reason=? WHERE warn_id=?", (self.new_reason.value[:96], wid))
-            await db.commit()
+            await db_execute(db, "UPDATE warns SET reason=? WHERE warn_id=?", (self.new_reason.value[:96], wid))
         embed = discord.Embed(title="Warn editado", color=discord.Color.blue())
         embed.add_field(name="ID", value=f"`{wid}`")
         embed.add_field(name="Nuevo motivo", value=self.new_reason.value)
@@ -700,14 +711,12 @@ class DeleteWarnModal(discord.ui.Modal, title="Borrar Warn"):
             return await interaction.response.send_message("Sin permisos.", ephemeral=True)
         wid = self.warn_id.value.strip().lower()
         async with db_connect() as db:
-            async with db.execute("SELECT * FROM warns WHERE warn_id=?", (wid,)) as cur:
-                row = await cur.fetchone()
+            row = await db_fetchone(db, "SELECT * FROM warns WHERE warn_id=?", (wid,))
             if not row:
                 return await interaction.response.send_message("Warn no encontrado.", ephemeral=True)
             if row["user_id"] == interaction.user.id:
                 return await interaction.response.send_message("No puedes borrar un warn dirigido a ti mismo.", ephemeral=True)
-            await db.execute("DELETE FROM warns WHERE warn_id=?", (wid,))
-            await db.commit()
+            await db_execute(db, "DELETE FROM warns WHERE warn_id=?", (wid,))
         embed = discord.Embed(title="Warn eliminado", color=discord.Color.red())
         embed.add_field(name="ID", value=f"`{wid}`")
         embed.add_field(name="Usuario", value=f"<@{row['user_id']}>")
@@ -787,8 +796,7 @@ class DeleteHashModal(discord.ui.Modal, title="Borrar pHash"):
             return await interaction.response.send_message("Sin permiso.", ephemeral=True)
         h = self.hash_val.value.strip().lower()
         async with db_connect() as db:
-            await db.execute("DELETE FROM phashes WHERE hash=?", (h,))
-            await db.commit()
+            await db_execute(db, "DELETE FROM phashes WHERE hash=?", (h,))
         embed = discord.Embed(title="pHash eliminado", color=discord.Color.red())
         embed.add_field(name="Hash", value=f"`{h}`")
         embed.add_field(name="Por", value=interaction.user.mention)
@@ -803,7 +811,7 @@ class DeleteHashModal(discord.ui.Modal, title="Borrar pHash"):
 async def on_ready():
     await init_db()
     await expire_old_warns()
-    print(f"Bot listo | {bot.user} | Hamming ≤ {PHASH_MAX_DISTANCE}")
+    print(f"Bot listo | {bot.user} | Turso | Hamming ≤ {PHASH_MAX_DISTANCE}")
 
 
 @bot.event
@@ -869,10 +877,6 @@ async def on_message(message: discord.Message):
 @bot.command(name="warn")
 @commands.has_permissions(manage_messages=True)
 async def warn_command(ctx: commands.Context, user_query: str, *, rest: str):
-    """
-    .n warn <usuario> <motivo> <cantidad>
-    Ejemplo: .n warn @user spam de memes 2
-    """
     try:
         if not ctx.guild:
             return await ctx.send("Solo en servidor.")
@@ -916,11 +920,9 @@ async def warns_command(ctx: commands.Context, subcommand: str = "", *, user_que
                 return await ctx.send("Usuario no encontrado.")
         async with db_connect() as db:
             if user:
-                async with db.execute("SELECT * FROM warns WHERE guild_id=? AND user_id=? ORDER BY timestamp DESC", (ctx.guild.id, user.id)) as cur:
-                    data = await cur.fetchall()
+                data = await db_fetchall(db, "SELECT * FROM warns WHERE guild_id=? AND user_id=? ORDER BY timestamp DESC", (ctx.guild.id, user.id))
             else:
-                async with db.execute("SELECT * FROM warns WHERE guild_id=? ORDER BY timestamp DESC LIMIT 100", (ctx.guild.id,)) as cur:
-                    data = await cur.fetchall()
+                data = await db_fetchall(db, "SELECT * FROM warns WHERE guild_id=? ORDER BY timestamp DESC LIMIT 100", (ctx.guild.id,))
         if not data:
             return await ctx.send("No hay warns." if not user else f"{user.display_name} no tiene warns.")
         view = WarnPaginationView(data, is_global=user is None, user=user)
@@ -940,8 +942,7 @@ async def phash_command(ctx: commands.Context, target: str, *, sanctions: str = 
             if not can_use_phash_list(ctx.author):
                 return await ctx.send("No tienes permiso para ver la lista de pHash.")
             async with db_connect() as db:
-                async with db.execute("SELECT * FROM phashes WHERE guild_id=? ORDER BY timestamp DESC", (ctx.guild.id,)) as cur:
-                    data = await cur.fetchall()
+                data = await db_fetchall(db, "SELECT * FROM phashes WHERE guild_id=? ORDER BY timestamp DESC", (ctx.guild.id,))
             if not data:
                 return await ctx.send("No hay hashes registrados.")
             view = PHashPaginationView(data)
@@ -968,13 +969,15 @@ async def phash_command(ctx: commands.Context, target: str, *, sanctions: str = 
 
         async with db_connect() as db:
             try:
-                await db.execute(
+                await db_execute(
+                    db,
                     "INSERT INTO phashes (hash, sanctions, added_by, guild_id, timestamp, image_blob) VALUES (?,?,?,?,?,?)",
                     (img_hash, sanctions.lower(), ctx.author.id, ctx.guild.id, now_ts(), image_bytes)
                 )
-                await db.commit()
-            except aiosqlite.IntegrityError:
-                return await ctx.send(f"El hash `{img_hash}` ya existe.")
+            except Exception as e:
+                if "UNIQUE" in str(e).upper() or "constraint" in str(e).lower():
+                    return await ctx.send(f"El hash `{img_hash}` ya existe.")
+                raise
 
         embed = discord.Embed(title="pHash añadido a blacklist", color=discord.Color.green())
         embed.add_field(name="Hash", value=f"`{img_hash}`")
@@ -991,9 +994,6 @@ async def phash_command(ctx: commands.Context, target: str, *, sanctions: str = 
 @bot.command(name="awarn")
 @commands.has_permissions(manage_messages=True)
 async def awarn_command(ctx: commands.Context, user_query: str, *, rest: str):
-    """
-    .n awarn <usuario staff> <motivo> <cantidad>
-    """
     try:
         if not ctx.guild:
             return await ctx.send("Solo en servidor.")
@@ -1015,24 +1015,23 @@ async def awarn_command(ctx: commands.Context, user_query: str, *, rest: str):
 
         awarn_id = generate_id()
         async with db_connect() as db:
-            await db.execute(
+            await db_execute(
+                db,
                 "INSERT INTO awarns (awarn_id, user_id, mod_id, guild_id, reason, timestamp, weight) VALUES (?,?,?,?,?,?,?)",
                 (awarn_id, user.id, ctx.author.id, ctx.guild.id, reason, now_ts(), amount)
             )
-            await db.commit()
-            async with db.execute("SELECT COALESCE(SUM(weight),0) FROM awarns WHERE guild_id=? AND user_id=?", (ctx.guild.id, user.id)) as cur:
-                total = int((await cur.fetchone())[0] or 0)
+            row = await db_fetchone(db, "SELECT COALESCE(SUM(weight),0) as total FROM awarns WHERE guild_id=? AND user_id=?", (ctx.guild.id, user.id))
+            total = int(row["total"] if row else 0)
 
         demote_msg = ""
         if total >= 3 and level > 0:
-            # Bajar un nivel
             current_role = ctx.guild.get_role(AWARN_ROLES[level])
             lower_role = ctx.guild.get_role(AWARN_ROLES[level - 1])
             try:
                 if current_role:
-                    await user.remove_roles(current_role, reason=f"3+ awarns → demote")
+                    await user.remove_roles(current_role, reason="3+ awarns → demote")
                 if lower_role:
-                    await user.add_roles(lower_role, reason=f"3+ awarns → demote")
+                    await user.add_roles(lower_role, reason="3+ awarns → demote")
                 demote_msg = f"\n⚠️ **Demote:** bajó de nivel (ahora tiene el rol inferior)."
             except Exception as e:
                 demote_msg = f"\nNo se pudo demotear automáticamente: {e}"
@@ -1065,11 +1064,9 @@ async def awarns_command(ctx: commands.Context, subcommand: str = "", *, user_qu
                 return await ctx.send("Usuario no encontrado.")
         async with db_connect() as db:
             if user:
-                async with db.execute("SELECT * FROM awarns WHERE guild_id=? AND user_id=? ORDER BY timestamp DESC", (ctx.guild.id, user.id)) as cur:
-                    data = await cur.fetchall()
+                data = await db_fetchall(db, "SELECT * FROM awarns WHERE guild_id=? AND user_id=? ORDER BY timestamp DESC", (ctx.guild.id, user.id))
             else:
-                async with db.execute("SELECT * FROM awarns WHERE guild_id=? ORDER BY timestamp DESC LIMIT 50", (ctx.guild.id,)) as cur:
-                    data = await cur.fetchall()
+                data = await db_fetchall(db, "SELECT * FROM awarns WHERE guild_id=? ORDER BY timestamp DESC LIMIT 50", (ctx.guild.id,))
         if not data:
             return await ctx.send("No hay awarns.")
         lines = []
@@ -1103,4 +1100,6 @@ keep_alive()
 TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     raise RuntimeError("Falta DISCORD_TOKEN")
+if not TURSO_URL or not TURSO_TOKEN:
+    raise RuntimeError("Faltan TURSO_DATABASE_URL o TURSO_AUTH_TOKEN")
 bot.run(TOKEN)
