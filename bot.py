@@ -987,6 +987,33 @@ async def markov_command(ctx: commands.Context):
         f"Enviaré un mensaje cada {MARKOV_EVERY} mensajes (solo en este canal).",
         view=view
     )
+    
+@bot.command(name="phrase")
+@commands.has_permissions(manage_messages=True)
+async def phrase_command(ctx: commands.Context):
+    """Fuerza al bot a generar una frase de Markov en este canal."""
+    if not ctx.guild:
+        return await ctx.send("Solo en servidor.")
+
+    channel_id = ctx.channel.id
+
+    # Intentar generar
+    sentence = generate_markov_sentence(channel_id, max_words=70)
+
+    if sentence:
+        await ctx.send(sentence)
+    else:
+        # Mensajes chistosos cuando no hay suficiente texto o falla
+        frases_error = [
+            "Todavía no he absorbido suficiente caos de este canal... escribid más.",
+            "Mi cerebro de Markov está vacío. Alimentadme con mensajes.",
+            "Error 404: Personalidad no encontrada. Necesito más texto.",
+            "Aún no tengo suficiente material para decir estupideces de calidad.",
+            "Estoy en modo silencio porque este canal es demasiado aburrido todavía.",
+            "No tengo frases. Solo vacío existencial. Escribid más."
+        ]
+        import random
+        await ctx.send(random.choice(frases_error))
 
 
 @bot.command(name="warn")
