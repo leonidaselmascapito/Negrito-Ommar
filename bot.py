@@ -1010,6 +1010,12 @@ async def phrase_command(ctx: commands.Context):
             "Error 404: Personalidad no encontrada. Necesito más texto.",
             "Aún no tengo suficiente material para decir estupideces de calidad.",
             "Estoy en modo silencio porque este canal es demasiado aburrido todavía.",
+            "O me alimentan con texto, ¡o me convierto en Manolo la alpaca!",
+            "Texto, texto 🔔",
+            "DENME MÁS TEXTO, CHAVALES.",
+            "Les pediré amablemente que compartáis más texto y mensajes, así me permitiré armar cadenas de Markov. 🧐",
+            "DADME TEXTO 😈👌",
+            "Hola pibe, dame texto 😛"
             "No tengo frases. Solo vacío existencial. Escribid más."
         ]
         import random
