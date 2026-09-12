@@ -26,10 +26,10 @@ PREFIX = ".n "
 
 MUTE_ROLE_ID = 1483621610819948635
 LOG_CHANNELS = [1541275389450649680, 1483728856962826240]
-MOD_ROLES = [1483621610975002771, 1483621610975002772]
+MOD_ROLES = [1483621610975002771, 1483621610975002772]          # Admins
 APPEAL_ACCEPT_ROLE = 1483621610975002772
 PHASH_LIST_ROLE = 1483701058852356276
-MARKOV_ADMIN_ROLE = 1483621610975002771          # Solo este rol puede activar/desactivar Markov
+MARKOV_ADMIN_ROLE = 1483621610975002771
 
 AWARN_ROLES = [
     1483621610975002769,
@@ -57,9 +57,11 @@ markov_models: dict[int, Any] = {}
 markov_corpus: dict[int, str] = defaultdict(str)
 markov_message_count: dict[int, int] = defaultdict(int)
 markov_last_reply: dict[int, float] = defaultdict(float)
+markov_phrase_cooldown: dict[int, float] = defaultdict(float)   # por usuario
 MARKOV_MAX_CHARS = 10 * 1024 * 1024
 MARKOV_EVERY = 15
-MARKOV_COOLDOWN = 2.0
+MARKOV_COOLDOWN = 2.5
+MARKOV_PHRASE_COOLDOWN = 4.0
 MARKOV_HISTORY_LIMIT = 2560
 
 # ============================================================
@@ -207,10 +209,6 @@ def can_accept_appeals(member: discord.Member) -> bool:
     return any(role.id == APPEAL_ACCEPT_ROLE for role in getattr(member, "roles", []))
 
 
-def can_use_phash_list(member: discord.Member) -> bool:
-    return any(role.id == PHASH_LIST_ROLE for role in getattr(member, "roles", []))
-
-
 def can_control_markov(member: discord.Member) -> bool:
     return any(role.id == MARKOV_ADMIN_ROLE for role in getattr(member, "roles", []))
 
@@ -274,10 +272,9 @@ def build_markov_model(text: str):
     if not text or len(text) < 30:
         return None
     try:
-        # state_size=2 es mucho más tolerante con chats reales
         return markovify.Text(text, state_size=2)
     except Exception as e:
-        print(f"[markov build error] {e}")
+        print(f"[markov build] {e}")
         return None
 
 
@@ -290,11 +287,9 @@ def generate_markov_sentence(channel_id: int, max_words: int = 60) -> Optional[s
         if model:
             markov_models[channel_id] = model
         else:
-            print(f"[markov] No se pudo construir modelo. Corpus length: {len(corpus)}")
             return None
 
-    # Intentar varias veces con diferentes parámetros
-    for tries in (100, 50, 30):
+    for tries in (80, 40, 20):
         try:
             sentence = model.make_sentence(tries=tries, max_words=max_words)
             if sentence:
@@ -302,20 +297,16 @@ def generate_markov_sentence(channel_id: int, max_words: int = 60) -> Optional[s
         except Exception:
             continue
 
-    # Último recurso: intentar con make_short_sentence
     try:
-        sentence = model.make_short_sentence(max_chars=180, tries=50)
+        sentence = model.make_short_sentence(max_chars=160, tries=40)
         if sentence:
             return sentence
     except Exception:
         pass
-
-    print(f"[markov] Falló generación. Corpus: {len(corpus)} chars")
     return None
 
 
 async def load_channel_history(channel: discord.TextChannel, limit: int = MARKOV_HISTORY_LIMIT) -> int:
-    """Carga los últimos N mensajes del canal y construye el corpus + modelo."""
     texts = []
     count = 0
     try:
@@ -323,7 +314,7 @@ async def load_channel_history(channel: discord.TextChannel, limit: int = MARKOV
             if msg.author.bot:
                 continue
             content = msg.content.strip()
-            if content and not content.startswith(PREFIX):
+            if content and not content.startswith(PREFIX) and len(content) > 1:
                 texts.append(content)
                 count += 1
     except Exception as e:
@@ -333,7 +324,6 @@ async def load_channel_history(channel: discord.TextChannel, limit: int = MARKOV
     if not texts:
         return 0
 
-    # Unir de más antiguo a más reciente
     full_text = " ".join(reversed(texts))
     if len(full_text) > MARKOV_MAX_CHARS:
         full_text = full_text[-MARKOV_MAX_CHARS:]
@@ -637,7 +627,6 @@ class AppealView(discord.ui.View):
         if interaction.user.id != self.user_id:
             return await interaction.response.send_message("Solo el sancionado puede apelar.", ephemeral=True)
 
-        # Evitar múltiples apelaciones para el mismo warn
         async with db_connect() as db:
             existing = await db_fetchone(db, "SELECT appeal_id FROM appeals WHERE warn_id=? AND status='pending'", (self.warn_id,))
             if existing:
@@ -695,7 +684,6 @@ class AppealModView(discord.ui.View):
             await remove_effect(interaction.guild, self.user_id, cur["sanction_type"])
             await clear_sanction(self.user_id)
 
-        # Desactivar botones
         for item in self.children:
             item.disabled = True
         await interaction.response.edit_message(view=self)
@@ -705,7 +693,7 @@ class AppealModView(discord.ui.View):
         embed.add_field(name="Hash añadido a whitelist", value=f"`{self.detected_hash}`")
         embed.add_field(name="Moderador", value=interaction.user.mention)
         await send_logs(interaction.guild, embed)
-        await interaction.followup.send("Apelación aceptada. Hash añadido a whitelist y sanción retirada.", ephemeral=True)
+        await interaction.followup.send("Apelación aceptada.", ephemeral=True)
         self.stop()
 
     @discord.ui.button(label="Rechazar", style=discord.ButtonStyle.danger)
@@ -730,7 +718,7 @@ class MarkovView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if not can_control_markov(interaction.user):
-            await interaction.response.send_message("Solo el rol de administrador autorizado puede controlar Markov.", ephemeral=True)
+            await interaction.response.send_message("Solo el rol autorizado puede controlar Markov.", ephemeral=True)
             return False
         return True
 
@@ -738,16 +726,12 @@ class MarkovView(discord.ui.View):
     async def activate(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
         markov_enabled.add(self.channel_id)
-
-        # Cargar historial
         channel = interaction.channel
         count = await load_channel_history(channel, MARKOV_HISTORY_LIMIT)
-
         await interaction.followup.send(
-            f"✅ **Modo Markov activado** en este canal.\n"
+            f"✅ **Modo Markov activado**.\n"
             f"Se cargaron **{count}** mensajes del historial.\n"
-            f"Enviaré un mensaje cada {MARKOV_EVERY} mensajes.",
-            ephemeral=False
+            f"Generaré un mensaje cada {MARKOV_EVERY} mensajes.",
         )
         self.stop()
 
@@ -755,7 +739,7 @@ class MarkovView(discord.ui.View):
     async def deactivate(self, interaction: discord.Interaction, button: discord.ui.Button):
         markov_enabled.discard(self.channel_id)
         await interaction.response.edit_message(
-            content="❌ **Modo Markov desactivado** en este canal.\nLa base de texto se mantiene.",
+            content="❌ **Modo Markov desactivado**.\nLa base de texto se mantiene.",
             view=None
         )
         self.stop()
@@ -765,9 +749,7 @@ class MarkovView(discord.ui.View):
         status = "activado" if self.channel_id in markov_enabled else "desactivado"
         corpus_len = len(markov_corpus.get(self.channel_id, ""))
         await interaction.response.edit_message(
-            content=f"Estado actual de Markov en este canal: **{status}**\n"
-                    f"Tamaño del corpus: **{corpus_len}** caracteres.\n"
-                    f"No se realizó ningún cambio.",
+            content=f"Estado: **{status}**\nCorpus: **{corpus_len}** caracteres.\nNo se realizó ningún cambio.",
             view=None
         )
         self.stop()
@@ -822,21 +804,17 @@ class WarnPaginationView(discord.ui.View):
 
     async def check_mod(self, interaction):
         if not isinstance(interaction.user, discord.Member) or not has_mod_role(interaction.user):
-            await interaction.response.send_message("No tienes permisos.", ephemeral=True)
+            await interaction.response.send_message("Solo los administradores pueden editar o borrar warns.", ephemeral=True)
             return False
         return True
 
     async def prev_page(self, interaction):
-        if not await self.check_mod(interaction):
-            return
         if self.page > 1:
             self.page -= 1
         self.update_buttons()
         await interaction.response.edit_message(embed=self.generate_embed(), view=self)
 
     async def next_page(self, interaction):
-        if not await self.check_mod(interaction):
-            return
         if self.page < self.total_pages:
             self.page += 1
         self.update_buttons()
@@ -933,30 +911,26 @@ class PHashPaginationView(discord.ui.View):
             )
         return embed
 
-    async def check(self, interaction):
-        if not can_use_phash_list(interaction.user):
-            await interaction.response.send_message("No tienes permiso para ver esta lista.", ephemeral=True)
+    async def check_admin(self, interaction):
+        if not has_mod_role(interaction.user):
+            await interaction.response.send_message("Solo los administradores pueden borrar hashes.", ephemeral=True)
             return False
         return True
 
     async def prev_page(self, interaction):
-        if not await self.check(interaction):
-            return
         if self.page > 1:
             self.page -= 1
         self.update_buttons()
         await interaction.response.edit_message(embed=self.generate_embed(), view=self)
 
     async def next_page(self, interaction):
-        if not await self.check(interaction):
-            return
         if self.page < self.total_pages:
             self.page += 1
         self.update_buttons()
         await interaction.response.edit_message(embed=self.generate_embed(), view=self)
 
     async def delete_hash(self, interaction):
-        if not await self.check(interaction):
+        if not await self.check_admin(interaction):
             return
         await interaction.response.send_modal(DeleteHashModal())
 
@@ -965,7 +939,7 @@ class DeleteHashModal(discord.ui.Modal, title="Borrar pHash"):
     hash_val = discord.ui.TextInput(label="Hash a borrar", min_length=16, max_length=16)
 
     async def on_submit(self, interaction: discord.Interaction):
-        if not can_use_phash_list(interaction.user):
+        if not has_mod_role(interaction.user):
             return await interaction.response.send_message("Sin permiso.", ephemeral=True)
         h = self.hash_val.value.strip().lower()
         async with db_connect() as db:
@@ -984,7 +958,7 @@ class DeleteHashModal(discord.ui.Modal, title="Borrar pHash"):
 async def on_ready():
     await init_db()
     await expire_old_warns()
-    print(f"Bot listo | {bot.user} | Turso | Hamming ≤ {PHASH_MAX_DISTANCE} | Markov listo")
+    print(f"Bot listo | {bot.user} | Turso | Markov listo")
 
 
 @bot.event
@@ -1045,15 +1019,16 @@ async def on_message(message: discord.Message):
     # ==================== MARKOV ====================
     if message.channel.id in markov_enabled and not message.author.bot:
         content = message.content.strip()
-        if content and not content.startswith(PREFIX):
+        if content and not content.startswith(PREFIX) and len(content) > 1:
             current_text = markov_corpus[message.channel.id]
             if len(current_text) < MARKOV_MAX_CHARS:
                 markov_corpus[message.channel.id] = (current_text + " " + content).strip()
-                if markov_message_count[message.channel.id] % 20 == 0:
+                if markov_message_count[message.channel.id] % 15 == 0:
                     markov_models[message.channel.id] = build_markov_model(markov_corpus[message.channel.id])
 
         markov_message_count[message.channel.id] += 1
 
+        # Generar cada X mensajes
         if markov_message_count[message.channel.id] % MARKOV_EVERY == 0:
             sentence = generate_markov_sentence(message.channel.id)
             if sentence:
@@ -1062,16 +1037,19 @@ async def on_message(message: discord.Message):
                 except Exception:
                     pass
 
+        # Responder a replies del bot (con cooldown real)
         if message.reference and message.reference.message_id:
             try:
                 ref = message.reference.resolved
                 if ref is None:
                     ref = await message.channel.fetch_message(message.reference.message_id)
+
                 if ref and ref.author.id == bot.user.id:
                     now = time.time()
-                    if now - markov_last_reply[message.channel.id] >= MARKOV_COOLDOWN:
+                    last = markov_last_reply.get(message.channel.id, 0.0)
+                    if now - last >= MARKOV_COOLDOWN:
                         markov_last_reply[message.channel.id] = now
-                        reply = generate_markov_sentence(message.channel.id, max_words=55)
+                        reply = generate_markov_sentence(message.channel.id, max_words=45)
                         if reply:
                             await message.reply(reply)
             except Exception:
@@ -1084,56 +1062,60 @@ async def on_message(message: discord.Message):
 # COMMANDS
 # ============================================================
 @bot.command(name="markov")
-@commands.has_permissions(manage_messages=True)
 async def markov_command(ctx: commands.Context):
     if not ctx.guild:
         return await ctx.send("Solo en servidor.")
-
     if not can_control_markov(ctx.author):
-        return await ctx.send("Solo el rol de administrador autorizado puede controlar el modo Markov.")
+        return await ctx.send("Solo el rol autorizado puede controlar el modo Markov.")
 
     view = MarkovView(ctx.channel.id)
     status = "activado" if ctx.channel.id in markov_enabled else "desactivado"
     await ctx.send(
         f"**Modo Markov**\n"
         f"Estado actual: **{status}**\n"
-        f"Al activar se cargarán los últimos **{MARKOV_HISTORY_LIMIT}** mensajes del canal.\n"
+        f"Al activar se cargarán los últimos **{MARKOV_HISTORY_LIMIT}** mensajes.\n"
         f"Elige una opción:",
         view=view
     )
 
 
 @bot.command(name="phrase")
-@commands.has_permissions(manage_messages=True)
 async def phrase_command(ctx: commands.Context):
     if not ctx.guild:
         return await ctx.send("Solo en servidor.")
 
     if ctx.channel.id not in markov_enabled:
-        return await ctx.send("Markov no está activado en este canal. Usa `.n markov` primero.")
+        return await ctx.send("Markov no está activado en este canal.")
 
-    sentence = generate_markov_sentence(ctx.channel.id, max_words=70)
+    # Cooldown por usuario
+    now = time.time()
+    last = markov_phrase_cooldown.get(ctx.author.id, 0.0)
+    if now - last < MARKOV_PHRASE_COOLDOWN:
+        remaining = round(MARKOV_PHRASE_COOLDOWN - (now - last), 1)
+        return await ctx.send(f"Espera **{remaining}s** antes de usar `.n phrase` otra vez.", delete_after=5)
 
+    markov_phrase_cooldown[ctx.author.id] = now
+
+    sentence = generate_markov_sentence(ctx.channel.id, max_words=65)
     if sentence:
         await ctx.send(sentence)
     else:
-        frases_error = [
-            "Todavía no he absorbido suficiente caos de este canal... escribid más.",
-            "Mi cerebro de Markov está vacío. Alimentadme con mensajes.",
-            "Error 404: Personalidad no encontrada. Necesito más texto.",
-            "Aún no tengo suficiente material para decir estupideces de calidad.",
-            "Estoy en modo silencio porque este canal es demasiado aburrido todavía.",
-            "No tengo frases. Solo vacío existencial. Escribid más."
-        ]
-        await ctx.send(random.choice(frases_error))
+        corpus_len = len(markov_corpus.get(ctx.channel.id, ""))
+        await ctx.send(
+            f"No pude generar nada todavía.\n"
+            f"Corpus actual: **{corpus_len}** caracteres.\n"
+            f"Prueba escribir más o vuelve a activar Markov."
+        )
 
 
 @bot.command(name="warn")
-@commands.has_permissions(manage_messages=True)
 async def warn_command(ctx: commands.Context, user_query: str, *, rest: str):
+    if not ctx.guild:
+        return await ctx.send("Solo en servidor.")
+    if not has_mod_role(ctx.author):
+        return await ctx.send("Solo los administradores pueden aplicar warns.")
+
     try:
-        if not ctx.guild:
-            return await ctx.send("Solo en servidor.")
         parts = rest.rsplit(maxsplit=1)
         if len(parts) < 2 or not parts[1].isdigit():
             return await ctx.send("Uso: `.n warn <usuario> <motivo (máx 96)> <cantidad (1-2)>`")
@@ -1160,13 +1142,13 @@ async def warn_command(ctx: commands.Context, user_query: str, *, rest: str):
 
 
 @bot.command(name="warns")
-@commands.has_permissions(manage_messages=True)
 async def warns_command(ctx: commands.Context, subcommand: str = "", *, user_query: str = ""):
+    if not ctx.guild:
+        return await ctx.send("Solo en servidor.")
+    if subcommand.casefold() != "list":
+        return await ctx.send("Uso: `.n warns list` o `.n warns list <usuario>`")
+
     try:
-        if not ctx.guild:
-            return await ctx.send("Solo en servidor.")
-        if subcommand.casefold() != "list":
-            return await ctx.send("Uso: `.n warns list` o `.n warns list <usuario>`")
         user = None
         if user_query.strip():
             user = await resolve_member(ctx.guild, user_query.strip())
@@ -1186,29 +1168,31 @@ async def warns_command(ctx: commands.Context, subcommand: str = "", *, user_que
 
 
 @bot.command(name="pHash")
-@commands.has_permissions(manage_messages=True)
 async def phash_command(ctx: commands.Context, target: str, *, sanctions: str = ""):
+    if not ctx.guild:
+        return await ctx.send("Solo en servidor.")
+
+    # list → cualquiera puede ver
+    if target.casefold() == "list":
+        async with db_connect() as db:
+            data = await db_fetchall(db, "SELECT * FROM phashes WHERE guild_id=? ORDER BY timestamp DESC", (ctx.guild.id,))
+        if not data:
+            return await ctx.send("No hay hashes registrados.")
+        view = PHashPaginationView(data)
+        return await ctx.send(embed=view.generate_embed(), view=view)
+
+    # añadir hash → solo admins
+    if not has_mod_role(ctx.author):
+        return await ctx.send("Solo los administradores pueden añadir hashes.")
+
+    if not sanctions:
+        return await ctx.send(
+            "Uso: `.n pHash <ID|link|respuesta> <letras>`\n"
+            "a=Warn  b=2Warns  c=Kick  d=Mute1h  e=Mute1d  f=Ban1d  g=Ban1mes  h=Ban permanente\n"
+            "Ejemplo: `.n pHash 123456789 fh`"
+        )
+
     try:
-        if not ctx.guild:
-            return await ctx.send("Solo en servidor.")
-
-        if target.casefold() == "list":
-            if not can_use_phash_list(ctx.author):
-                return await ctx.send("No tienes permiso para ver la lista de pHash.")
-            async with db_connect() as db:
-                data = await db_fetchall(db, "SELECT * FROM phashes WHERE guild_id=? ORDER BY timestamp DESC", (ctx.guild.id,))
-            if not data:
-                return await ctx.send("No hay hashes registrados.")
-            view = PHashPaginationView(data)
-            return await ctx.send(embed=view.generate_embed(), view=view)
-
-        if not sanctions:
-            return await ctx.send(
-                "Uso: `.n pHash <ID|link|respuesta> <letras>`\n"
-                "a=Warn  b=2Warns  c=Kick  d=Mute1h  e=Mute1d  f=Ban1d  g=Ban1mes  h=Ban permanente\n"
-                "Ejemplo: `.n pHash 123456789 fh`"
-            )
-
         target_msg, image_bytes = await get_image(ctx, target)
         if not image_bytes:
             return await ctx.send(
@@ -1240,17 +1224,19 @@ async def phash_command(ctx: commands.Context, target: str, *, sanctions: str = 
         if target_msg:
             embed.add_field(name="Mensaje", value=str(target_msg.id))
         await send_logs(ctx.guild, embed)
-        await ctx.send(f"✅ Hash `{img_hash}` registrado.\nSanciones: `{sanctions}` → **{label}**\nDistancia máxima: {PHASH_MAX_DISTANCE}")
+        await ctx.send(f"✅ Hash `{img_hash}` registrado.\nSanciones: `{sanctions}` → **{label}**")
     except Exception as e:
         await ctx.send(f"Error: `{e}`")
 
 
 @bot.command(name="awarn")
-@commands.has_permissions(manage_messages=True)
 async def awarn_command(ctx: commands.Context, user_query: str, *, rest: str):
+    if not ctx.guild:
+        return await ctx.send("Solo en servidor.")
+    if not has_mod_role(ctx.author):
+        return await ctx.send("Solo los administradores pueden aplicar awarns.")
+
     try:
-        if not ctx.guild:
-            return await ctx.send("Solo en servidor.")
         parts = rest.rsplit(maxsplit=1)
         if len(parts) < 2 or not parts[1].isdigit():
             return await ctx.send("Uso: `.n awarn <usuario> <motivo> <cantidad>`")
@@ -1286,9 +1272,9 @@ async def awarn_command(ctx: commands.Context, user_query: str, *, rest: str):
                     await user.remove_roles(current_role, reason="3+ awarns → demote")
                 if lower_role:
                     await user.add_roles(lower_role, reason="3+ awarns → demote")
-                demote_msg = f"\n⚠️ **Demote:** bajó de nivel (ahora tiene el rol inferior)."
+                demote_msg = f"\n⚠️ **Demote:** bajó de nivel."
             except Exception as e:
-                demote_msg = f"\nNo se pudo demotear automáticamente: {e}"
+                demote_msg = f"\nNo se pudo demotear: {e}"
 
         embed = discord.Embed(title="Awarn aplicado", color=discord.Color.dark_orange())
         embed.add_field(name="Usuario", value=f"{user.mention}")
@@ -1304,13 +1290,15 @@ async def awarn_command(ctx: commands.Context, user_query: str, *, rest: str):
 
 
 @bot.command(name="awarns")
-@commands.has_permissions(manage_messages=True)
 async def awarns_command(ctx: commands.Context, subcommand: str = "", *, user_query: str = ""):
+    if not ctx.guild:
+        return await ctx.send("Solo en servidor.")
+    if not has_mod_role(ctx.author):
+        return await ctx.send("Solo los administradores pueden ver awarns.")
+    if subcommand.casefold() != "list":
+        return await ctx.send("Uso: `.n awarns list` o `.n awarns list <usuario>`")
+
     try:
-        if not ctx.guild:
-            return await ctx.send("Solo en servidor.")
-        if subcommand.casefold() != "list":
-            return await ctx.send("Uso: `.n awarns list` o `.n awarns list <usuario>`")
         user = None
         if user_query.strip():
             user = await resolve_member(ctx.guild, user_query.strip())
@@ -1340,7 +1328,7 @@ async def on_command_error(ctx, error):
     if isinstance(error, commands.CommandNotFound):
         return
     if isinstance(error, commands.MissingPermissions):
-        return await ctx.send("Necesitas permiso **Gestionar mensajes**.")
+        return await ctx.send("No tienes permisos suficientes.")
     if isinstance(error, commands.MissingRequiredArgument):
         return await ctx.send("Faltan argumentos.")
     await ctx.send(f"Error: `{error}`")
