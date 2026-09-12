@@ -271,27 +271,47 @@ def generate_id() -> str:
 # MARKOV HELPERS
 # ============================================================
 def build_markov_model(text: str):
-    if not text or len(text) < 50:
+    if not text or len(text) < 30:
         return None
     try:
-        return markovify.Text(text, state_size=3)
-    except Exception:
+        # state_size=2 es mucho más tolerante con chats reales
+        return markovify.Text(text, state_size=2)
+    except Exception as e:
+        print(f"[markov build error] {e}")
         return None
 
 
-def generate_markov_sentence(channel_id: int, max_words: int = 75) -> Optional[str]:
+def generate_markov_sentence(channel_id: int, max_words: int = 60) -> Optional[str]:
     model = markov_models.get(channel_id)
+    corpus = markov_corpus.get(channel_id, "")
+
     if not model:
-        corpus = markov_corpus.get(channel_id, "")
         model = build_markov_model(corpus)
         if model:
             markov_models[channel_id] = model
         else:
+            print(f"[markov] No se pudo construir modelo. Corpus length: {len(corpus)}")
             return None
+
+    # Intentar varias veces con diferentes parámetros
+    for tries in (100, 50, 30):
+        try:
+            sentence = model.make_sentence(tries=tries, max_words=max_words)
+            if sentence:
+                return sentence
+        except Exception:
+            continue
+
+    # Último recurso: intentar con make_short_sentence
     try:
-        return model.make_sentence(tries=50, max_words=max_words)
+        sentence = model.make_short_sentence(max_chars=180, tries=50)
+        if sentence:
+            return sentence
     except Exception:
-        return None
+        pass
+
+    print(f"[markov] Falló generación. Corpus: {len(corpus)} chars")
+    return None
 
 
 async def load_channel_history(channel: discord.TextChannel, limit: int = MARKOV_HISTORY_LIMIT) -> int:
