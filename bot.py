@@ -26,7 +26,7 @@ PREFIX = ".n "
 
 MUTE_ROLE_ID = 1483621610819948635
 LOG_CHANNELS = [1541275389450649680, 1483728856962826240]
-MOD_ROLES = [1483621610975002771, 1483621610975002772]          # Admins
+MOD_ROLES = [1483621610975002771, 1483621610975002772]
 APPEAL_ACCEPT_ROLE = 1483621610975002772
 PHASH_LIST_ROLE = 1483701058852356276
 MARKOV_ADMIN_ROLE = 1483621610975002771
@@ -53,16 +53,20 @@ BAN_31D = 31 * 24 * 60 * 60
 
 # ==================== MARKOV ====================
 markov_enabled: set[int] = set()
-markov_models: dict[int, Any] = {}
+markov_models: dict[int, dict[int, Any]] = defaultdict(dict)   # channel_id → {order: model}
 markov_corpus: dict[int, str] = defaultdict(str)
 markov_message_count: dict[int, int] = defaultdict(int)
 markov_last_reply: dict[int, float] = defaultdict(float)
-markov_phrase_cooldown: dict[int, float] = defaultdict(float)   # por usuario
+markov_phrase_cooldown: dict[int, float] = defaultdict(float)
+markov_order: dict[int, int] = defaultdict(lambda: 2)          # orden por canal (1-5)
+markov_cmd_cooldown: dict[int, float] = defaultdict(float)     # cooldown de 2h por canal para .n markov
+
 MARKOV_MAX_CHARS = 10 * 1024 * 1024
 MARKOV_EVERY = 15
 MARKOV_COOLDOWN = 2.5
 MARKOV_PHRASE_COOLDOWN = 4.0
 MARKOV_HISTORY_LIMIT = 5120
+MARKOV_CMD_COOLDOWN = 2 * 60 * 60   # 2 horas
 
 # ============================================================
 # DISCORD
@@ -268,24 +272,29 @@ def generate_id() -> str:
 # ============================================================
 # MARKOV HELPERS
 # ============================================================
-def build_markov_model(text: str):
+def build_markov_model(text: str, order: int = 2):
     if not text or len(text) < 30:
         return None
+    order = max(1, min(5, order))
     try:
-        return markovify.Text(text, state_size=2)
+        return markovify.Text(text, state_size=order)
     except Exception as e:
-        print(f"[markov build] {e}")
+        print(f"[markov build order={order}] {e}")
         return None
 
 
-def generate_markov_sentence(channel_id: int, max_words: int = 60) -> Optional[str]:
-    model = markov_models.get(channel_id)
+def generate_markov_sentence(channel_id: int, order: Optional[int] = None, max_words: int = 60) -> Optional[str]:
+    if order is None:
+        order = markov_order.get(channel_id, 2)
+    order = max(1, min(5, order))
+
+    model = markov_models[channel_id].get(order)
     corpus = markov_corpus.get(channel_id, "")
 
     if not model:
-        model = build_markov_model(corpus)
+        model = build_markov_model(corpus, order)
         if model:
-            markov_models[channel_id] = model
+            markov_models[channel_id][order] = model
         else:
             return None
 
@@ -329,7 +338,9 @@ async def load_channel_history(channel: discord.TextChannel, limit: int = MARKOV
         full_text = full_text[-MARKOV_MAX_CHARS:]
 
     markov_corpus[channel.id] = full_text
-    markov_models[channel.id] = build_markov_model(full_text)
+    # Pre-construir el modelo del orden actual
+    current_order = markov_order.get(channel.id, 2)
+    markov_models[channel.id][current_order] = build_markov_model(full_text, current_order)
     markov_message_count[channel.id] = count
     return count
 
@@ -711,45 +722,116 @@ class AppealModView(discord.ui.View):
         self.stop()
 
 
+class MarkovConfigView(discord.ui.View):
+    """Elegir orden 1-5"""
+    def __init__(self, channel_id: int):
+        super().__init__(timeout=120)
+        self.channel_id = channel_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not can_control_markov(interaction.user):
+            await interaction.response.send_message("Solo el rol autorizado puede configurar Markov.", ephemeral=True)
+            return False
+        return True
+
+    async def _set_order(self, interaction: discord.Interaction, order: int):
+        markov_order[self.channel_id] = order
+        # Construir el modelo de ese orden si hay corpus
+        corpus = markov_corpus.get(self.channel_id, "")
+        if corpus:
+            markov_models[self.channel_id][order] = build_markov_model(corpus, order)
+        await interaction.response.edit_message(
+            content=f"✅ Orden de Markov configurado a **{order}** para este canal.\n"
+                    f"(1 = más caótico / 5 = más coherente)",
+            view=None
+        )
+        self.stop()
+
+    @discord.ui.button(label="1", style=discord.ButtonStyle.secondary)
+    async def o1(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._set_order(interaction, 1)
+
+    @discord.ui.button(label="2", style=discord.ButtonStyle.secondary)
+    async def o2(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._set_order(interaction, 2)
+
+    @discord.ui.button(label="3", style=discord.ButtonStyle.primary)
+    async def o3(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._set_order(interaction, 3)
+
+    @discord.ui.button(label="4", style=discord.ButtonStyle.secondary)
+    async def o4(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._set_order(interaction, 4)
+
+    @discord.ui.button(label="5", style=discord.ButtonStyle.secondary)
+    async def o5(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._set_order(interaction, 5)
+
+
 class MarkovView(discord.ui.View):
     def __init__(self, channel_id: int):
         super().__init__(timeout=180)
         self.channel_id = channel_id
+        self.used = False
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if not can_control_markov(interaction.user):
             await interaction.response.send_message("Solo el rol autorizado puede controlar Markov.", ephemeral=True)
             return False
+        if self.used:
+            await interaction.response.send_message("Esta acción ya fue usada.", ephemeral=True)
+            return False
         return True
 
     @discord.ui.button(label="Activar", style=discord.ButtonStyle.success)
     async def activate(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
+        self.used = True
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(view=self)
+
         markov_enabled.add(self.channel_id)
         channel = interaction.channel
         count = await load_channel_history(channel, MARKOV_HISTORY_LIMIT)
         await interaction.followup.send(
             f"✅ **Modo Markov activado**.\n"
-            f"Se cargaron **{count}** mensajes del historial.\n"
-            f"Generaré un mensaje cada {MARKOV_EVERY} mensajes.",
+            f"Se cargaron **{count}** mensajes de humanos.\n"
+            f"Orden actual: **{markov_order.get(self.channel_id, 2)}**\n"
+            f"Generaré un mensaje cada {MARKOV_EVERY} mensajes."
         )
         self.stop()
 
     @discord.ui.button(label="Desactivar", style=discord.ButtonStyle.danger)
     async def deactivate(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.used = True
         markov_enabled.discard(self.channel_id)
+        for item in self.children:
+            item.disabled = True
         await interaction.response.edit_message(
             content="❌ **Modo Markov desactivado**.\nLa base de texto se mantiene.",
-            view=None
+            view=self
         )
         self.stop()
+
+    @discord.ui.button(label="Configurar orden", style=discord.ButtonStyle.primary)
+    async def config(self, interaction: discord.Interaction, button: discord.ui.Button):
+        current = markov_order.get(self.channel_id, 2)
+        view = MarkovConfigView(self.channel_id)
+        await interaction.response.send_message(
+            f"Elige el **orden** de la cadena de Markov (actual: **{current}**)\n"
+            f"1 = más random / caótico\n"
+            f"5 = más coherente / predecible",
+            view=view,
+            ephemeral=True
+        )
 
     @discord.ui.button(label="Solo ver estado", style=discord.ButtonStyle.secondary)
     async def status(self, interaction: discord.Interaction, button: discord.ui.Button):
         status = "activado" if self.channel_id in markov_enabled else "desactivado"
         corpus_len = len(markov_corpus.get(self.channel_id, ""))
+        order = markov_order.get(self.channel_id, 2)
         await interaction.response.edit_message(
-            content=f"Estado: **{status}**\nCorpus: **{corpus_len}** caracteres.\nNo se realizó ningún cambio.",
+            content=f"Estado: **{status}**\nOrden: **{order}**\nCorpus: **{corpus_len}** caracteres.\nNo se realizó ningún cambio.",
             view=None
         )
         self.stop()
@@ -1023,12 +1105,18 @@ async def on_message(message: discord.Message):
             current_text = markov_corpus[message.channel.id]
             if len(current_text) < MARKOV_MAX_CHARS:
                 markov_corpus[message.channel.id] = (current_text + " " + content).strip()
-                if markov_message_count[message.channel.id] % 15 == 0:
-                    markov_models[message.channel.id] = build_markov_model(markov_corpus[message.channel.id])
+            else:
+                # Sobrescribir (quedarse con la parte más reciente)
+                markov_corpus[message.channel.id] = (current_text + " " + content)[-MARKOV_MAX_CHARS:]
+
+            if markov_message_count[message.channel.id] % 20 == 0:
+                order = markov_order.get(message.channel.id, 2)
+                markov_models[message.channel.id][order] = build_markov_model(
+                    markov_corpus[message.channel.id], order
+                )
 
         markov_message_count[message.channel.id] += 1
 
-        # Generar cada X mensajes
         if markov_message_count[message.channel.id] % MARKOV_EVERY == 0:
             sentence = generate_markov_sentence(message.channel.id)
             if sentence:
@@ -1037,7 +1125,6 @@ async def on_message(message: discord.Message):
                 except Exception:
                     pass
 
-        # Responder a replies del bot (con cooldown real)
         if message.reference and message.reference.message_id:
             try:
                 ref = message.reference.resolved
@@ -1068,19 +1155,29 @@ async def markov_command(ctx: commands.Context):
     if not can_control_markov(ctx.author):
         return await ctx.send("Solo el rol autorizado puede controlar el modo Markov.")
 
+    # Cooldown de 2 horas por canal
+    now = time.time()
+    last = markov_cmd_cooldown.get(ctx.channel.id, 0.0)
+    if now - last < MARKOV_CMD_COOLDOWN:
+        remaining = int((MARKOV_CMD_COOLDOWN - (now - last)) / 60)
+        return await ctx.send(f"Cooldownespera **{remaining} minutos** antes de usar `.n markov` otra vez en este canal.")
+
+    markov_cmd_cooldown[ctx.channel.id] = now
+
     view = MarkovView(ctx.channel.id)
     status = "activado" if ctx.channel.id in markov_enabled else "desactivado"
+    order = markov_order.get(ctx.channel.id, 2)
     await ctx.send(
         f"**Modo Markov**\n"
-        f"Estado actual: **{status}**\n"
-        f"Al activar se cargarán los últimos **{MARKOV_HISTORY_LIMIT}** mensajes.\n"
+        f"Estado: **{status}** | Orden: **{order}**\n"
+        f"Al activar se cargarán los últimos **{MARKOV_HISTORY_LIMIT}** mensajes de humanos.\n"
         f"Elige una opción:",
         view=view
     )
 
 
 @bot.command(name="phrase")
-async def phrase_command(ctx: commands.Context):
+async def phrase_command(ctx: commands.Context, order: Optional[int] = None):
     if not ctx.guild:
         return await ctx.send("Solo en servidor.")
 
@@ -1092,19 +1189,24 @@ async def phrase_command(ctx: commands.Context):
     last = markov_phrase_cooldown.get(ctx.author.id, 0.0)
     if now - last < MARKOV_PHRASE_COOLDOWN:
         remaining = round(MARKOV_PHRASE_COOLDOWN - (now - last), 1)
-        return await ctx.send(f"Espera **{remaining}s** antes de usar `.n phrase` otra vez.", delete_after=5)
+        return await ctx.send(f"Espera **{remaining}s**.", delete_after=4)
 
     markov_phrase_cooldown[ctx.author.id] = now
 
-    sentence = generate_markov_sentence(ctx.channel.id, max_words=65)
+    if order is not None:
+        if order < 1 or order > 5:
+            return await ctx.send("El orden debe ser un número del **1 al 5**.")
+    else:
+        order = markov_order.get(ctx.channel.id, 2)
+
+    sentence = generate_markov_sentence(ctx.channel.id, order=order, max_words=65)
     if sentence:
         await ctx.send(sentence)
     else:
         corpus_len = len(markov_corpus.get(ctx.channel.id, ""))
         await ctx.send(
-            f"No pude generar nada todavía.\n"
-            f"Corpus actual: **{corpus_len}** caracteres.\n"
-            f"Prueba escribir más o vuelve a activar Markov."
+            f"No pude generar nada.\n"
+            f"Corpus: **{corpus_len}** caracteres | Orden pedido: **{order}**"
         )
 
 
@@ -1172,7 +1274,6 @@ async def phash_command(ctx: commands.Context, target: str, *, sanctions: str = 
     if not ctx.guild:
         return await ctx.send("Solo en servidor.")
 
-    # list → cualquiera puede ver
     if target.casefold() == "list":
         async with db_connect() as db:
             data = await db_fetchall(db, "SELECT * FROM phashes WHERE guild_id=? ORDER BY timestamp DESC", (ctx.guild.id,))
@@ -1181,7 +1282,6 @@ async def phash_command(ctx: commands.Context, target: str, *, sanctions: str = 
         view = PHashPaginationView(data)
         return await ctx.send(embed=view.generate_embed(), view=view)
 
-    # añadir hash → solo admins
     if not has_mod_role(ctx.author):
         return await ctx.send("Solo los administradores pueden añadir hashes.")
 
