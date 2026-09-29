@@ -785,12 +785,21 @@ class MarkovView(discord.ui.View):
 
     @discord.ui.button(label="Activar", style=discord.ButtonStyle.success)
     async def activate(self, interaction: discord.Interaction, button: discord.ui.Button):
+        now = time.time()
+        last = markov_cmd_cooldown.get(self.channel_id, 0.0)
+        if now - last < MARKOV_CMD_COOLDOWN:
+            remaining = int((MARKOV_CMD_COOLDOWN - (now - last)) / 60)
+            return await interaction.response.send_message(
+                f"Espera **{remaining} minutos** antes de activar/desactivar Markov otra vez.",
+                ephemeral=True
+            )
         self.used = True
         for item in self.children:
             item.disabled = True
         await interaction.response.edit_message(view=self)
 
         markov_enabled.add(self.channel_id)
+        markov_cmd_cooldown[self.channel_id] = now
         channel = interaction.channel
         count = await load_channel_history(channel, MARKOV_HISTORY_LIMIT)
         await interaction.followup.send(
@@ -803,7 +812,16 @@ class MarkovView(discord.ui.View):
 
     @discord.ui.button(label="Desactivar", style=discord.ButtonStyle.danger)
     async def deactivate(self, interaction: discord.Interaction, button: discord.ui.Button):
+        now = time.time()
+        last = markov_cmd_cooldown.get(self.channel_id, 0.0)
+        if now - last < MARKOV_CMD_COOLDOWN:
+            remaining = int((MARKOV_CMD_COOLDOWN - (now - last)) / 60)
+            return await interaction.response.send_message(
+                f"Espera **{remaining} minutos** antes de activar/desactivar Markov otra vez.",
+                ephemeral=True
+            )
         self.used = True
+        markov_cmd_cooldown[self.channel_id] = now
         markov_enabled.discard(self.channel_id)
         for item in self.children:
             item.disabled = True
@@ -956,6 +974,101 @@ class DeleteWarnModal(discord.ui.Modal, title="Borrar Warn"):
         embed.add_field(name="Moderador", value=interaction.user.mention)
         await send_logs(interaction.guild, embed)
         await interaction.response.send_message(f"Warn `{wid}` eliminado.", ephemeral=True)
+
+
+
+class AWarnPaginationView(discord.ui.View):
+    def __init__(self, data, is_global, user=None, page=1):
+        super().__init__(timeout=300)
+        self.data = data
+        self.is_global = is_global
+        self.user = user
+        self.page = page
+        self.per_page = 5
+        self.total_pages = max(1, (len(data) + self.per_page - 1) // self.per_page)
+        self.update_buttons()
+
+    def update_buttons(self):
+        self.clear_items()
+        prev_b = discord.ui.Button(label="Anterior", style=discord.ButtonStyle.secondary, disabled=self.page <= 1)
+        next_b = discord.ui.Button(label="Siguiente", style=discord.ButtonStyle.secondary, disabled=self.page >= self.total_pages)
+        del_b = discord.ui.Button(label="Borrar", style=discord.ButtonStyle.danger)
+        prev_b.callback = self.prev_page
+        next_b.callback = self.next_page
+        del_b.callback = self.delete_awarn
+        self.add_item(prev_b)
+        self.add_item(next_b)
+        self.add_item(del_b)
+
+    def generate_embed(self):
+        start = (self.page - 1) * self.per_page
+        page_data = self.data[start:start + self.per_page]
+        title = "Lista global de awarns" if self.is_global else f"Awarns de {self.user.display_name if self.user else 'usuario'}"
+        total = sum(int(r.get("weight", 0)) for r in self.data)
+        embed = discord.Embed(
+            title=title,
+            color=discord.Color.dark_orange(),
+            description=f"**Puntos totales:** {total}\n**Registros:** {len(self.data)}"
+        )
+        embed.set_footer(text=f"Página {self.page}/{self.total_pages}")
+        for r in page_data:
+            embed.add_field(
+                name=f"ID: `{r['awarn_id']}`",
+                value=(
+                    f"**Usuario:** <@{r['user_id']}>\n"
+                    f"**Mod:** <@{r['mod_id']}>\n"
+                    f"**Motivo:** {r['reason']}\n"
+                    f"**Peso:** {r['weight']}\n"
+                    f"**Fecha:** {discord_timestamp(r['timestamp'])}"
+                ),
+                inline=False
+            )
+        return embed
+
+    async def check_mod(self, interaction):
+        if not isinstance(interaction.user, discord.Member) or not has_mod_role(interaction.user):
+            await interaction.response.send_message("Solo los administradores pueden borrar awarns.", ephemeral=True)
+            return False
+        return True
+
+    async def prev_page(self, interaction):
+        if self.page > 1:
+            self.page -= 1
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.generate_embed(), view=self)
+
+    async def next_page(self, interaction):
+        if self.page < self.total_pages:
+            self.page += 1
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.generate_embed(), view=self)
+
+    async def delete_awarn(self, interaction):
+        if not await self.check_mod(interaction):
+            return
+        await interaction.response.send_modal(DeleteAWarnModal())
+
+
+class DeleteAWarnModal(discord.ui.Modal, title="Borrar Awarn"):
+    awarn_id = discord.ui.TextInput(label="Awarn ID (16 hex)", min_length=16, max_length=16)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not has_mod_role(interaction.user):
+            return await interaction.response.send_message("Sin permisos.", ephemeral=True)
+        aid = self.awarn_id.value.strip().lower()
+        async with db_connect() as db:
+            row = await db_fetchone(db, "SELECT * FROM awarns WHERE awarn_id=?", (aid,))
+            if not row:
+                return await interaction.response.send_message("Awarn no encontrado.", ephemeral=True)
+            if row["user_id"] == interaction.user.id:
+                return await interaction.response.send_message("No puedes borrar un awarn dirigido a ti mismo.", ephemeral=True)
+            await db_execute(db, "DELETE FROM awarns WHERE awarn_id=?", (aid,))
+        embed = discord.Embed(title="Awarn eliminado", color=discord.Color.red())
+        embed.add_field(name="ID", value=f"`{aid}`")
+        embed.add_field(name="Usuario", value=f"<@{row['user_id']}>")
+        embed.add_field(name="Moderador", value=interaction.user.mention)
+        await send_logs(interaction.guild, embed)
+        await interaction.response.send_message(f"Awarn `{aid}` eliminado.", ephemeral=True)
 
 
 class PHashPaginationView(discord.ui.View):
@@ -1155,22 +1268,18 @@ async def markov_command(ctx: commands.Context):
     if not can_control_markov(ctx.author):
         return await ctx.send("Solo el rol autorizado puede controlar el modo Markov.")
 
-    # Cooldown de 2 horas por canal
-    now = time.time()
-    last = markov_cmd_cooldown.get(ctx.channel.id, 0.0)
-    if now - last < MARKOV_CMD_COOLDOWN:
-        remaining = int((MARKOV_CMD_COOLDOWN - (now - last)) / 60)
-        return await ctx.send(f"Cooldownespera **{remaining} minutos** antes de usar `.n markov` otra vez en este canal.")
-
-    markov_cmd_cooldown[ctx.channel.id] = now
-
+    # El cooldown de 2h solo se aplica al activar/desactivar (no a ver estado ni configurar)
     view = MarkovView(ctx.channel.id)
     status = "activado" if ctx.channel.id in markov_enabled else "desactivado"
     order = markov_order.get(ctx.channel.id, 2)
+    last = markov_cmd_cooldown.get(ctx.channel.id, 0.0)
+    remaining_min = max(0, int((MARKOV_CMD_COOLDOWN - (time.time() - last)) / 60))
+    cooldown_info = f"\nEspera de activar/desactivar: **{remaining_min} min**" if remaining_min > 0 else ""
     await ctx.send(
         f"**Modo Markov**\n"
         f"Estado: **{status}** | Orden: **{order}**\n"
-        f"Al activar se cargarán los últimos **{MARKOV_HISTORY_LIMIT}** mensajes de humanos.\n"
+        f"Al activar se cargarán los últimos **{MARKOV_HISTORY_LIMIT}** mensajes de humanos."
+        f"{cooldown_info}\n"
         f"Elige una opción:",
         view=view
     )
@@ -1408,14 +1517,11 @@ async def awarns_command(ctx: commands.Context, subcommand: str = "", *, user_qu
             if user:
                 data = await db_fetchall(db, "SELECT * FROM awarns WHERE guild_id=? AND user_id=? ORDER BY timestamp DESC", (ctx.guild.id, user.id))
             else:
-                data = await db_fetchall(db, "SELECT * FROM awarns WHERE guild_id=? ORDER BY timestamp DESC LIMIT 50", (ctx.guild.id,))
+                data = await db_fetchall(db, "SELECT * FROM awarns WHERE guild_id=? ORDER BY timestamp DESC LIMIT 100", (ctx.guild.id,))
         if not data:
-            return await ctx.send("No hay awarns.")
-        lines = []
-        for r in data[:15]:
-            lines.append(f"`{r['awarn_id']}` • <@{r['user_id']}> • peso {r['weight']} • {r['reason'][:40]} • {discord_timestamp(r['timestamp'])}")
-        embed = discord.Embed(title="Lista de awarns", description="\n".join(lines), color=discord.Color.dark_orange())
-        await ctx.send(embed=embed)
+            return await ctx.send("No hay awarns." if not user else f"{user.display_name} no tiene awarns.")
+        view = AWarnPaginationView(data, is_global=user is None, user=user)
+        await ctx.send(embed=view.generate_embed(), view=view)
     except Exception as e:
         await ctx.send(f"Error: `{e}`")
 
