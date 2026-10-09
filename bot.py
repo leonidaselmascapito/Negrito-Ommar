@@ -68,6 +68,16 @@ MARKOV_PHRASE_COOLDOWN = 4.0
 MARKOV_HISTORY_LIMIT = 5120
 MARKOV_CMD_COOLDOWN = 2 * 60 * 60   # 2 horas
 
+# ==================== ARCHIVE ====================
+ARCHIVE_CHANNEL_ID = 1558225883607597096
+ARCHIVE_CMD_COOLDOWN = 24 * 60 * 60  # 1 día
+archive_enabled: set[int] = set()          # guild_ids con archivo activo
+archive_batch_size: dict[int, int] = defaultdict(lambda: 5)  # 1-200
+archive_cmd_cooldown: dict[int, float] = defaultdict(float)  # por guild
+archive_task: dict[int, asyncio.Task] = {}  # scrape en curso
+archive_stats: dict[int, dict] = defaultdict(lambda: {"count": 0, "chars": 0})
+archive_lock = asyncio.Lock()
+
 # ============================================================
 # DISCORD
 # ============================================================
@@ -192,6 +202,14 @@ async def init_db():
                 weight INTEGER NOT NULL DEFAULT 1
             )
         """)
+        await db_execute(db, """
+            CREATE TABLE IF NOT EXISTS archived_ids (
+                message_id INTEGER PRIMARY KEY,
+                guild_id INTEGER NOT NULL,
+                archived_at REAL NOT NULL
+            )
+        """)
+
 
 
 # ============================================================
@@ -267,6 +285,138 @@ async def send_logs(guild: Optional[discord.Guild], embed: discord.Embed, view: 
 
 def generate_id() -> str:
     return secrets.token_hex(8)
+
+
+# ============================================================
+# ARCHIVE HELPERS
+# ============================================================
+def is_server_owner(member: discord.Member) -> bool:
+    return member.guild is not None and member.id == member.guild.owner_id
+
+
+def format_archive_entry(message: discord.Message) -> str:
+    author = message.author
+    name = getattr(author, "display_name", None) or author.name
+    channel_name = getattr(message.channel, "name", str(message.channel.id))
+    created = message.created_at
+    # UTC with seconds
+    fecha = created.strftime("%Y-%m-%d %H:%M:%S UTC")
+    lines = [
+        f"**{name}** (`{author.id}`)",
+        f"Canal: #{channel_name}",
+        f"Fecha: {fecha}",
+    ]
+    content = (message.content or "").strip()
+    if content:
+        lines.append(f"Contenido: {content}")
+    else:
+        lines.append("Contenido: *(sin texto)*")
+
+    if message.reference and message.reference.message_id:
+        lines.append(f"Respuesta a: `{message.reference.message_id}`")
+
+    if message.attachments:
+        urls = [a.url for a in message.attachments]
+        lines.append("Adjuntos:")
+        for u in urls:
+            lines.append(f"  {u}")
+
+    if message.stickers:
+        lines.append(f"Stickers: {', '.join(s.name for s in message.stickers)}")
+
+    lines.append(f"||{message.id}||")
+    return "\n".join(lines)
+
+
+async def is_message_archived(message_id: int) -> bool:
+    async with db_connect() as db:
+        row = await db_fetchone(db, "SELECT 1 FROM archived_ids WHERE message_id=?", (message_id,))
+        return row is not None
+
+
+async def mark_message_archived(message_id: int, guild_id: int):
+    async with db_connect() as db:
+        try:
+            await db_execute(
+                db,
+                "INSERT OR IGNORE INTO archived_ids (message_id, guild_id, archived_at) VALUES (?,?,?)",
+                (message_id, guild_id, now_ts())
+            )
+        except Exception as e:
+            print(f"[archive mark] {e}")
+
+
+async def archive_send(guild: discord.Guild, text: str, message_id: int):
+    channel = guild.get_channel(ARCHIVE_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(ARCHIVE_CHANNEL_ID)
+        except Exception as e:
+            print(f"[archive channel] {e}")
+            return False
+    try:
+        # Discord limit 2000 chars
+        if len(text) > 1900:
+            text = text[:1900] + "\n…(truncado)"
+        await channel.send(text)
+        await mark_message_archived(message_id, guild.id)
+        archive_stats[guild.id]["count"] += 1
+        archive_stats[guild.id]["chars"] += len(text)
+        return True
+    except Exception as e:
+        print(f"[archive send] {e}")
+        return False
+
+
+async def archive_one_message(message: discord.Message) -> bool:
+    if message.author.bot or not message.guild:
+        return False
+    if await is_message_archived(message.id):
+        return False
+    text = format_archive_entry(message)
+    return await archive_send(message.guild, text, message.id)
+
+
+async def archive_scrape_guild(guild: discord.Guild):
+    """Recorre todos los canales de texto y archiva mensajes humanos antiguos."""
+    batch = archive_batch_size.get(guild.id, 5)
+    sent_in_batch = 0
+    try:
+        for channel in guild.text_channels:
+            if guild.id not in archive_enabled:
+                break
+            try:
+                async for msg in channel.history(limit=None, oldest_first=True):
+                    if guild.id not in archive_enabled:
+                        break
+                    if msg.author.bot:
+                        continue
+                    if await is_message_archived(msg.id):
+                        continue
+                    ok = await archive_one_message(msg)
+                    if ok:
+                        sent_in_batch += 1
+                        # rate limit suave
+                        if sent_in_batch >= batch:
+                            await asyncio.sleep(1.2)
+                            sent_in_batch = 0
+                        else:
+                            await asyncio.sleep(0.35)
+            except discord.Forbidden:
+                continue
+            except Exception as e:
+                print(f"[archive scrape #{getattr(channel,'name',channel.id)}] {e}")
+                continue
+    except asyncio.CancelledError:
+        print(f"[archive] scrape cancelado guild={guild.id}")
+        raise
+    except Exception as e:
+        print(f"[archive scrape] {e}")
+    finally:
+        archive_task.pop(guild.id, None)
+        print(f"[archive] scrape terminado guild={guild.id} stats={archive_stats[guild.id]}")
+
+
 
 
 # ============================================================
@@ -768,6 +918,150 @@ class MarkovConfigView(discord.ui.View):
         await self._set_order(interaction, 5)
 
 
+
+class ArchiveConfigView(discord.ui.View):
+    """Elegir batch size 1 / 5 / 20 / 50 / 200"""
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=120)
+        self.guild_id = guild_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not is_server_owner(interaction.user):
+            await interaction.response.send_message("Solo el owner del server puede configurar el archivo.", ephemeral=True)
+            return False
+        return True
+
+    async def _set(self, interaction: discord.Interaction, size: int):
+        archive_batch_size[self.guild_id] = size
+        await interaction.response.edit_message(
+            content=f"✅ Tamaño de lote configurado a **{size}** mensajes.",
+            view=None
+        )
+        self.stop()
+
+    @discord.ui.button(label="1", style=discord.ButtonStyle.secondary)
+    async def b1(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._set(interaction, 1)
+
+    @discord.ui.button(label="5", style=discord.ButtonStyle.primary)
+    async def b5(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._set(interaction, 5)
+
+    @discord.ui.button(label="20", style=discord.ButtonStyle.secondary)
+    async def b20(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._set(interaction, 20)
+
+    @discord.ui.button(label="50", style=discord.ButtonStyle.secondary)
+    async def b50(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._set(interaction, 50)
+
+    @discord.ui.button(label="200", style=discord.ButtonStyle.secondary)
+    async def b200(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._set(interaction, 200)
+
+
+class ArchiveView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=180)
+        self.guild_id = guild_id
+        self.used = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # status puede cualquiera del staff? Solo owner para todo según pedido
+        if not is_server_owner(interaction.user):
+            await interaction.response.send_message("Solo el owner del server puede usar el archivo.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Activar", style=discord.ButtonStyle.success)
+    async def activate(self, interaction: discord.Interaction, button: discord.ui.Button):
+        now = time.time()
+        last = archive_cmd_cooldown.get(self.guild_id, 0.0)
+        if now - last < ARCHIVE_CMD_COOLDOWN:
+            remaining = int((ARCHIVE_CMD_COOLDOWN - (now - last)) / 60)
+            return await interaction.response.send_message(
+                f"Espera **{remaining} minutos** antes de activar/desactivar el archivo.",
+                ephemeral=True
+            )
+        archive_cmd_cooldown[self.guild_id] = now
+        archive_enabled.add(self.guild_id)
+
+        # cancel previous scrape if any
+        old = archive_task.get(self.guild_id)
+        if old and not old.done():
+            old.cancel()
+
+        guild = interaction.guild
+        task = bot.loop.create_task(archive_scrape_guild(guild))
+        archive_task[self.guild_id] = task
+
+        batch = archive_batch_size.get(self.guild_id, 5)
+        await interaction.response.edit_message(
+            content=(
+                f"✅ **Archivo activado**.\n"
+                f"• Canal destino: <#{ARCHIVE_CHANNEL_ID}>\n"
+                f"• Lote: **{batch}**\n"
+                f"• Empezando a copiar historial de todos los canales (puede tardar mucho).\n"
+                f"• Los mensajes nuevos también se archivarán en vivo."
+            ),
+            view=None
+        )
+        self.stop()
+
+    @discord.ui.button(label="Desactivar", style=discord.ButtonStyle.danger)
+    async def deactivate(self, interaction: discord.Interaction, button: discord.ui.Button):
+        now = time.time()
+        last = archive_cmd_cooldown.get(self.guild_id, 0.0)
+        if now - last < ARCHIVE_CMD_COOLDOWN:
+            remaining = int((ARCHIVE_CMD_COOLDOWN - (now - last)) / 60)
+            return await interaction.response.send_message(
+                f"Espera **{remaining} minutos** antes de activar/desactivar el archivo.",
+                ephemeral=True
+            )
+        archive_cmd_cooldown[self.guild_id] = now
+        archive_enabled.discard(self.guild_id)
+        old = archive_task.pop(self.guild_id, None)
+        if old and not old.done():
+            old.cancel()
+        await interaction.response.edit_message(
+            content="❌ **Archivo desactivado**.\nSe detuvo el historial y el archivo en vivo. Los IDs ya archivados se conservan (no se reenvían).",
+            view=None
+        )
+        self.stop()
+
+    @discord.ui.button(label="Ver estado", style=discord.ButtonStyle.secondary)
+    async def status(self, interaction: discord.Interaction, button: discord.ui.Button):
+        st = archive_stats.get(self.guild_id, {"count": 0, "chars": 0})
+        enabled = self.guild_id in archive_enabled
+        batch = archive_batch_size.get(self.guild_id, 5)
+        running = self.guild_id in archive_task and not archive_task[self.guild_id].done()
+        # count from DB for accuracy
+        async with db_connect() as db:
+            row = await db_fetchone(db, "SELECT COUNT(*) as c FROM archived_ids WHERE guild_id=?", (self.guild_id,))
+            db_count = int(row["c"]) if row else 0
+        await interaction.response.send_message(
+            f"**Estado del archivo**\n"
+            f"• Activo: **{'sí' if enabled else 'no'}**\n"
+            f"• Scrape en curso: **{'sí' if running else 'no'}**\n"
+            f"• Lote: **{batch}**\n"
+            f"• Mensajes archivados (DB): **{db_count}**\n"
+            f"• En esta sesión: **{st['count']}** msgs / **{st['chars']}** caracteres\n"
+            f"• Canal: <#{ARCHIVE_CHANNEL_ID}>",
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Editar lote", style=discord.ButtonStyle.primary)
+    async def edit(self, interaction: discord.Interaction, button: discord.ui.Button):
+        current = archive_batch_size.get(self.guild_id, 5)
+        view = ArchiveConfigView(self.guild_id)
+        await interaction.response.send_message(
+            f"Elige cuántos mensajes enviar por lote (actual: **{current}**).\n"
+            f"1 = más lento y seguro · 200 = más rápido (más riesgo de rate limit).",
+            view=view,
+            ephemeral=True
+        )
+
+
 class MarkovView(discord.ui.View):
     def __init__(self, channel_id: int):
         super().__init__(timeout=180)
@@ -1153,7 +1447,7 @@ class DeleteHashModal(discord.ui.Modal, title="Borrar pHash"):
 async def on_ready():
     await init_db()
     await expire_old_warns()
-    print(f"Bot listo | {bot.user} | Turso | Markov listo")
+    print(f"Bot listo | {bot.user} | Turso | Markov | Archive listo")
 
 
 @bot.event
@@ -1161,6 +1455,13 @@ async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         await bot.process_commands(message)
         return
+
+    # ==================== ARCHIVE live ====================
+    if message.guild.id in archive_enabled:
+        try:
+            await archive_one_message(message)
+        except Exception as e:
+            print(f"[archive live] {e}")
 
     # ==================== pHash auto ====================
     if message.attachments:
@@ -1261,6 +1562,31 @@ async def on_message(message: discord.Message):
 # ============================================================
 # COMMANDS
 # ============================================================
+@bot.command(name="archive")
+async def archive_command(ctx: commands.Context):
+    if not ctx.guild:
+        return await ctx.send("Solo en servidor.")
+    if not is_server_owner(ctx.author):
+        return await ctx.send("Solo el **owner** del server puede usar `.n archive`.")
+
+    view = ArchiveView(ctx.guild.id)
+    enabled = ctx.guild.id in archive_enabled
+    batch = archive_batch_size.get(ctx.guild.id, 5)
+    st = archive_stats.get(ctx.guild.id, {"count": 0, "chars": 0})
+    last = archive_cmd_cooldown.get(ctx.guild.id, 0.0)
+    remaining_min = max(0, int((ARCHIVE_CMD_COOLDOWN - (time.time() - last)) / 60))
+    cd = f"\nCooldownespera activar/desactivar: **{remaining_min} min**" if remaining_min > 0 else ""
+    await ctx.send(
+        f"**Modo Archivo**\n"
+        f"Estado: **{'activado' if enabled else 'desactivado'}** | Lote: **{batch}**\n"
+        f"Canal destino: <#{ARCHIVE_CHANNEL_ID}>\n"
+        f"Sesión: {st['count']} msgs / {st['chars']} chars"
+        f"{cd}\n"
+        f"Elige una opción:",
+        view=view
+    )
+
+
 @bot.command(name="markov")
 async def markov_command(ctx: commands.Context):
     if not ctx.guild:
